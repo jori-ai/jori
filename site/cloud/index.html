@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jori on a rented server</title>
+<meta name="description" content="Run Jori on a small server you rent from a cloud provider. Paste a few lines when you create it, and the setup page opens in your browser. No terminal.">
+<link rel="icon" type="image/png" href="/icon.png?v=4">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+<style>
+  :root { --bg:#f4efe6; --ink:#141414; --muted:#5e5a52; --line:#d9d1c3; --tint:#ebe4d8; --yes:#1f7a4d; --no:#a3473a; --card:#fbf8f3; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#121110; --ink:#f1ece3; --muted:#a39d92; --line:#2c2925; --tint:#24211d; --yes:#5fc28f; --no:#e08a7c; --card:#181614; } }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--ink); font:16px/1.6 Inter, system-ui, sans-serif; }
+  .wrap { max-width:760px; margin:0 auto; padding:0 20px 64px; }
+  .nav { display:flex; align-items:center; justify-content:space-between; padding:20px 0; }
+  .brand { display:flex; align-items:center; gap:10px; color:var(--ink); text-decoration:none; font-family:"Source Serif 4", Georgia, serif; font-weight:600; font-size:22px; }
+  .brand img { width:30px; height:30px; }
+  .nav a.back { color:var(--muted); font-size:14px; text-decoration:none; }
+  h1 { font-family:"Source Serif 4", Georgia, serif; font-weight:600; font-size:clamp(34px, 5.4vw, 52px); line-height:1.06; letter-spacing:-.02em; margin-top:5vh; }
+  .lede { font-size:19px; color:var(--muted); margin-top:18px; max-width:620px; }
+  ol.steps { list-style:none; padding:0; margin-top:40px; counter-reset:s; display:grid; gap:18px; }
+  ol.steps > li { counter-increment:s; background:var(--card); border:1px solid var(--line); border-radius:16px; padding:22px 22px 22px 64px; position:relative; }
+  ol.steps > li::before { content:counter(s); position:absolute; left:20px; top:20px; width:30px; height:30px; border-radius:50%; background:var(--ink); color:var(--bg); display:grid; place-items:center; font-weight:600; font-size:15px; }
+  h2 { font-size:18px; font-weight:600; margin-bottom:6px; }
+  p + p, p + ul, ul + p { margin-top:10px; }
+  .muted { color:var(--muted); }
+  ul.plain { padding-left:18px; color:var(--muted); }
+  .tabs { display:flex; gap:6px; margin:14px 0 10px; flex-wrap:wrap; }
+  .tabs button { font:500 14px Inter, sans-serif; border:1px solid var(--line); background:transparent; color:var(--muted); border-radius:999px; padding:6px 14px; cursor:pointer; }
+  .tabs button[aria-selected="true"] { background:var(--ink); color:var(--bg); border-color:var(--ink); }
+  pre { background:var(--ink); color:var(--bg); border-radius:12px; padding:14px 16px; overflow-x:auto; font:13px/1.55 "JetBrains Mono", ui-monospace, monospace; white-space:pre; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:12px; }
+  .btn { display:inline-block; font:500 15px Inter, sans-serif; background:var(--ink); color:var(--bg); border:0; text-decoration:none; padding:11px 20px; border-radius:999px; cursor:pointer; }
+  .btn.quiet { background:transparent; color:var(--ink); box-shadow:inset 0 0 0 1.5px var(--line); }
+  .btn[aria-disabled="true"] { opacity:.4; pointer-events:none; }
+  input[type=text] { font:15px "JetBrains Mono", monospace; padding:10px 14px; border-radius:10px; border:1px solid var(--line); background:var(--bg); color:var(--ink); width:220px; max-width:100%; }
+  .status { margin-top:12px; font-size:15px; }
+  .status.ok { color:var(--yes); } .status.bad { color:var(--no); }
+  code { font-family:"JetBrains Mono", monospace; font-size:.9em; background:var(--tint); padding:1px 6px; border-radius:5px; }
+  .note { margin-top:36px; color:var(--muted); font-size:14.5px; }
+  .note h3 { color:var(--ink); font-size:15px; margin:18px 0 4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="nav">
+    <a class="brand" href="/"><img src="/icon.png?v=4" alt="">Jori</a>
+    <a class="back" href="/start#run">Other ways to run Jori</a>
+  </nav>
+
+  <h1>Run Jori on a server you rent.</h1>
+  <p class="lede">Jori needs a computer that stays on. If you don't want to keep your own Mac or PC running, rent a small one from a cloud provider. You paste a few lines when you create it, and the setup page opens in your browser. No terminal.</p>
+
+  <ol class="steps">
+    <li>
+      <h2>Create an account with a cloud provider</h2>
+      <p class="muted">Any provider that offers Ubuntu 24.04 works. Two simple ones:</p>
+      <ul class="plain">
+        <li><a href="https://www.hetzner.com/cloud" rel="noopener">Hetzner Cloud</a>: the cheapest. A server with 2 CPUs and 4 GB of memory (type CX22) is a few euros a month.</li>
+        <li><a href="https://www.digitalocean.com/products/droplets" rel="noopener">DigitalOcean</a>: a Basic Droplet with 4 GB of memory.</li>
+      </ul>
+      <p class="muted">Pick at least 4 GB of memory. You pay the provider directly, by the hour, and can delete the server any time.</p>
+    </li>
+
+    <li>
+      <h2>Copy your setup lines</h2>
+      <p class="muted">They carry a private key made in this browser just now. It opens your setup page, so don't share it. This page remembers it, so you can come back.</p>
+      <pre id="userdata">…</pre>
+      <div class="row">
+        <button class="btn" type="button" id="copy">Copy</button>
+        <button class="btn quiet" type="button" id="fresh">Make a new key</button>
+      </div>
+    </li>
+
+    <li>
+      <h2>Create the server and paste them in</h2>
+      <div class="tabs" role="tablist">
+        <button type="button" role="tab" aria-selected="true" data-tab="hetzner">Hetzner</button>
+        <button type="button" role="tab" aria-selected="false" data-tab="do">DigitalOcean</button>
+        <button type="button" role="tab" aria-selected="false" data-tab="other">Another provider</button>
+      </div>
+      <div data-panel="hetzner">
+        <ul class="plain">
+          <li>In the Hetzner Cloud console, open a project and press <b>Add Server</b>.</li>
+          <li>Image: <b>Ubuntu 24.04</b>. Type: <b>CX22</b> (or bigger).</li>
+          <li>Leave networking as it is (a public IPv4 address).</li>
+          <li>Under <b>Cloud config</b>, paste your setup lines.</li>
+          <li>Press <b>Create &amp; Buy now</b>, then copy the server's IPv4 address.</li>
+        </ul>
+      </div>
+      <div data-panel="do" hidden>
+        <ul class="plain">
+          <li>In DigitalOcean, press <b>Create</b> → <b>Droplets</b>.</li>
+          <li>Image: <b>Ubuntu 24.04 (LTS)</b>. Size: Basic, <b>4 GB</b> memory (or more).</li>
+          <li>Choose a password or SSH key (you won't need it, but DigitalOcean asks).</li>
+          <li>Open <b>Advanced options</b>, tick <b>Add Initialization scripts</b>, and paste your setup lines.</li>
+          <li>Press <b>Create Droplet</b>, then copy its ipv4 address.</li>
+        </ul>
+      </div>
+      <div data-panel="other" hidden>
+        <ul class="plain">
+          <li>Create an <b>Ubuntu 24.04</b> server with 4 GB of memory and a public IPv4 address.</li>
+          <li>Paste your setup lines into its <b>user data</b> or <b>cloud-init</b> box.</li>
+          <li>Let web traffic in (ports 80 and 443) if the provider has a firewall.</li>
+        </ul>
+      </div>
+    </li>
+
+    <li>
+      <h2>Open your setup page</h2>
+      <p class="muted">Paste the server's IPv4 address. Installing takes about ten minutes after the server starts; this page checks every few seconds and the button lights up when it's ready.</p>
+      <div class="row">
+        <input type="text" id="ip" placeholder="203.0.113.7" inputmode="decimal" autocomplete="off" spellcheck="false" aria-label="Server IPv4 address">
+        <a class="btn" id="open" aria-disabled="true" href="#" target="_blank" rel="noopener">Open setup</a>
+      </div>
+      <p class="status" id="status" aria-live="polite"></p>
+    </li>
+  </ol>
+
+  <div class="note">
+    <h3>What the lines do</h3>
+    <p>On the server's first start they run <a href="/cloud-init.sh">this script</a>: it makes a <code>jori</code> user, runs the <a href="/install.sh">normal installer</a>, and serves the setup page at <code>https://&lt;address&gt;.sslip.io</code> with a real certificate, behind your private key. When you press Finish on the setup page, the server stops answering on the internet. Jori then talks to your phone through your own Supabase project, not through the server's address.</p>
+    <h3>What works on a server</h3>
+    <p>Everything except the Mac-only features (iMessage, Notes, Photos, Find My), which need Jori on a Mac.</p>
+    <h3>Something went wrong?</h3>
+    <p>If the button never lights up after 20 minutes, delete the server and create it again with the same lines. Logs are on the server in <code>/var/log/jori-cloud-init.log</code>.</p>
+  </div>
+</div>
+
+<script>
+(() => {
+  const KEY = "jori-cloud-token";
+  const $ = (id) => document.getElementById(id);
+  const store = {
+    get() { try { return localStorage.getItem(KEY); } catch { return null; } },
+    set(v) { try { localStorage.setItem(KEY, v); } catch {} },
+  };
+  const mint = () => {
+    const b = new Uint8Array(24); crypto.getRandomValues(b);
+    return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  };
+  let token = store.get();
+  if (!token || !/^[a-f0-9]{48}$/.test(token)) { token = mint(); store.set(token); }
+
+  const lines = () => `#cloud-config\nruncmd:\n  - curl -fsSL https://getjori.ai/cloud-init.sh | JORI_SETUP_TOKEN=${token} bash\n`;
+  const render = () => { $("userdata").textContent = lines(); check(); };
+
+  $("copy").addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(lines()); $("copy").textContent = "Copied"; setTimeout(() => ($("copy").textContent = "Copy"), 1500); }
+    catch { const r = document.createRange(); r.selectNodeContents($("userdata")); getSelection().removeAllRanges(); getSelection().addRange(r); }
+  });
+  $("fresh").addEventListener("click", () => {
+    if (!confirm("A new key won't open a server you already created with the old one. Make a new key?")) return;
+    token = mint(); store.set(token); render();
+  });
+
+  document.querySelectorAll("[role=tab]").forEach((t) => t.addEventListener("click", () => {
+    document.querySelectorAll("[role=tab]").forEach((x) => x.setAttribute("aria-selected", String(x === t)));
+    document.querySelectorAll("[data-panel]").forEach((p) => (p.hidden = p.dataset.panel !== t.dataset.tab));
+  }));
+
+  const IPV4 = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
+  let timer = null;
+  try { const ip = localStorage.getItem(KEY + "-ip"); if (ip) $("ip").value = ip; } catch {}
+  $("ip").addEventListener("input", () => { try { localStorage.setItem(KEY + "-ip", $("ip").value.trim()); } catch {} check(); });
+
+  function setStatus(text, cls) { $("status").textContent = text; $("status").className = "status" + (cls ? " " + cls : ""); }
+  function check() {
+    clearTimeout(timer);
+    const ip = $("ip").value.trim();
+    $("open").setAttribute("aria-disabled", "true");
+    if (!ip) return setStatus("");
+    if (!IPV4.test(ip)) return setStatus("That doesn't look like an IPv4 address (four numbers with dots).", "bad");
+    const host = ip.replace(/\./g, "-") + ".sslip.io";
+    $("open").href = `https://${host}/?t=${token}`;
+    fetch(`https://${host}/status`, { cache: "no-store" })
+      .then((r) => r.ok ? r.text() : Promise.reject(new Error(String(r.status))))
+      .then((s) => {
+        s = s.trim();
+        if (s === "ready") { setStatus("Ready. Open your setup page.", "ok"); $("open").setAttribute("aria-disabled", "false"); }
+        else if (s === "done") { setStatus("Setup on this server is already finished.", "ok"); }
+        else { setStatus("The server is installing Jori…"); timer = setTimeout(check, 8000); }
+      })
+      .catch(() => { setStatus("Waiting for the server to start and get its certificate. This can take a few minutes."); timer = setTimeout(check, 8000); });
+  }
+  render();
+})();
+</script>
+</body>
+</html>

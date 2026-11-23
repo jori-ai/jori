@@ -1,14 +1,25 @@
 # Quickstart
 
-## The one-line install (macOS)
+Jori needs a computer that stays on. A Mac is not required:
+
+| Where | How |
+|---|---|
+| **Mac** | [Jori.dmg](https://github.com/jori-ai/jori/releases/latest/download/Jori.dmg) (the menu bar app below), or the one-line install. |
+| **Windows 10 (2004+) / 11** | [JoriSetup.exe](https://github.com/jori-ai/jori/releases/latest/download/JoriSetup.exe), or in PowerShell `irm https://getjori.ai/install.ps1 \| iex`. Jori runs inside WSL 2; see [Windows](#windows). |
+| **A rented server** | [getjori.ai/cloud](https://getjori.ai/cloud); see [A rented server](#a-rented-server). |
+| **Linux** | the one-line install. |
+
+iMessage, Notes, Photos and Find My need Jori on a Mac; everything else works everywhere.
+
+## The one-line install (macOS, Linux)
 
 ```bash
 curl -fsSL https://getjori.ai/install.sh | bash
 ```
 
-That installs what is missing (Homebrew, Node.js 22.5+, git, Claude Code, Ollama with its embedding model), puts Jori in `~/Dev/jori`, and opens the **setup page** in your browser. The page needs about two minutes and a few clicks:
+That installs what is missing (Node.js 22.5+, git, Claude Code, Ollama with its embedding model), puts Jori in `~/Dev/jori`, and opens the **setup page** in your browser. On a Mac it uses Homebrew if you have it; without Homebrew it needs no password (Node goes into `~/.local/node`, git comes from Apple's developer tools, which may open Apple's installer window once, and Ollama into `~/Applications`). The page needs about two minutes and a few clicks:
 
-1. **Your Mac** — checks Node, Claude Code and memory search, and installs what is missing.
+1. **This computer** — checks Node, Claude Code and memory search, and installs what is missing.
 2. **Claude sign-in** — signs in with your Claude subscription (`claude auth login` underneath) and checks the plan. Jori is built for Max.
 3. **About you** — your name, email, home city, time zone and the assistant's name, filled in from this Mac (macOS account name, the Claude sign-in's email, the system time zone). Each field says what it changes. Fix what is wrong and save.
 4. **Connect services** — one card per outside service, each saying what it switches on and what it costs: Supabase (needed for the phone app; the card also creates its tables), Google, instant mail (a Cloudflare Tunnel), your own email address, WhatsApp, Slack and Jev. **Test and save** checks the keys with the provider and saves only what works. Skip any; the same cards come back with `jori setup` or `jori init`.
@@ -27,6 +38,14 @@ The same installer, other ways:
 | **npm** | `npm create jori` (or `npx create-jori`). Source: `packages/create-jori/`. |
 
 Keep it current with `jori update` (fast-forward pull, packages, restart).
+
+### Windows
+
+`JoriSetup.exe` (source `apps/windows/`, logic in `site/install.ps1`) turns on WSL if it is off (Windows asks for approval once and may need a restart, after which the install resumes by itself), imports Ubuntu 24.04 as a WSL distro named **Jori** with systemd on and a Linux user named after you, runs the normal installer inside it, and opens the setup page in your Windows browser. It also adds a `Jori` item to the Windows Startup folder that keeps the distro running (Windows otherwise stops it when its last window closes) and Start-menu items: **Jori setup**, **Jori control room**, **Update Jori**, **Repair Jori**. Keep the PC plugged in with sleep off (setup checks). The exe is not code-signed yet: SmartScreen says "Windows protected your PC"; choose **More info → Run anyway**. Uninstall from Settings → Apps; it asks before deleting the Jori distro and what it stored.
+
+### A rented server
+
+No computer to keep on: [getjori.ai/cloud](https://getjori.ai/cloud) makes a private key in your browser and gives you cloud-init lines to paste into the provider's *user data* / *Cloud config* box when you create an Ubuntu 24.04 server (Hetzner CX22, a DigitalOcean 4 GB droplet, or any provider). On first boot `site/cloud-init.sh` creates a `jori` user, runs the normal installer, and serves the setup page at `https://<ip-with-dashes>.sslip.io/?t=<key>` through Caddy (a real certificate, no warning). The cloud page polls the server and lights up **Open setup** when it is ready (about ten minutes). Pressing **Finish** on the setup page stops the server answering on the internet; the phone app reaches Jori through your Supabase project, not the server's address. Log: `/var/log/jori-cloud-init.log`.
 
 ### On a Mac mini or a virtual machine
 

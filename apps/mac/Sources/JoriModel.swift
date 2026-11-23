@@ -43,11 +43,12 @@ final class JoriModel: ObservableObject {
         }
     }
 
-    // A GUI app starts with a bare PATH; the CLI needs Homebrew's node, git and claude.
+    // A GUI app starts with a bare PATH; the CLI needs node, git and claude
+    // (in ~/.local without Homebrew, see site/install.sh).
     var environment: [String: String] {
         var env = ProcessInfo.processInfo.environment
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        env["PATH"] = ["/opt/homebrew/bin", "/usr/local/bin", "\(home)/.local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin", env["PATH"] ?? ""].joined(separator: ":")
+        env["PATH"] = ["\(home)/.local/bin", "\(home)/.local/node/bin", "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin", env["PATH"] ?? ""].joined(separator: ":")
         env["JORI_HOME"] = self.home.path
         env["NO_COLOR"] = "1"
         return env
@@ -107,10 +108,6 @@ final class JoriModel: ObservableObject {
         }
     }
 
-    var hasHomebrew: Bool {
-        ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"].contains { FileManager.default.isExecutableFile(atPath: $0) }
-    }
-
     // MARK: actions
 
     /// Install with the bundled copy of site/install.sh, then open setup.
@@ -131,19 +128,6 @@ final class JoriModel: ObservableObject {
                 state = installed ? .stopped : .notInstalled
                 lastError = "The install stopped before it finished. The last lines below say why."
             }
-        }
-    }
-
-    /// Homebrew asks for the Mac password, which only Terminal can do.
-    func installInTerminal() {
-        let cmd = "curl -fsSL https://getjori.ai/install.sh | bash"
-        let src = "tell application \"Terminal\" to activate\ntell application \"Terminal\" to do script \"\(cmd)\""
-        var err: NSDictionary?
-        NSAppleScript(source: src)?.executeAndReturnError(&err)
-        if err != nil {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(cmd, forType: .string)
-            lastError = "Couldn't open Terminal. The install command is on your clipboard: paste it into Terminal."
         }
     }
 

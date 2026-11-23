@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Get started · Jori</title>
-<meta name="description" content="Meet Jori, an open-source assistant that pays attention even when you're not asking, then pick how to run it: on your own Mac or server for free, or soon on a server we run at cost.">
+<meta name="description" content="Meet Jori, an open-source assistant that pays attention even when you're not asking, then pick how to run it: on your own Mac, PC or rented server for free, or soon on a server we run at cost.">
 <meta property="og:title" content="Get started with Jori">
 <meta property="og:description" content="An assistant that pays attention, even when you're not asking. Run it yourself for free, or soon let us run it for you at cost.">
 <link rel="icon" type="image/png" href="/icon.png?v=4">
@@ -112,6 +112,8 @@
   .opt .end { margin-top:auto; padding-top:24px; }
   .term { display:flex; align-items:center; gap:12px; background:var(--ink); color:var(--bg); border-radius:14px; padding:14px 16px; }
   .term code { flex:1; min-width:0; white-space:normal; overflow-wrap:anywhere; font-size:13.5px; line-height:1.5; }
+  .dls { display:flex; flex-wrap:wrap; gap:10px; }
+  .dls .btn.quiet { background:transparent; color:var(--ink); box-shadow:inset 0 0 0 1.5px var(--line); }
   .copy { flex:none; background:transparent; color:var(--bg); border:1px solid currentColor; border-radius:999px; padding:5px 14px; font:500 13px Inter, system-ui, sans-serif; cursor:pointer; opacity:.85; }
   .copy:hover { opacity:1; }
   .copy:focus-visible { outline-color:var(--bg); }
@@ -231,27 +233,31 @@
 
   <section id="run" aria-labelledby="run-h">
     <h2 id="run-h">Where should I run?</h2>
-    <p class="sub">Jori needs a computer that stays on. Use your own, or let us run one for you.</p>
+    <p class="sub">Jori needs a computer that stays on: your own Mac or PC, a server you rent, or, soon, one we run for you.</p>
     <div class="options">
       <div class="opt">
         <div class="k">Free · Open source</div>
         <h3>Run it yourself.</h3>
-        <p>On a Mac that stays on, or a Linux server you rent (Linux support is new). You create the accounts Jori uses, and the setup page walks you through each one and tests it before saving.</p>
+        <p>On your own Mac or Windows PC that stays on, or a small Linux server you rent from a cloud provider (a few dollars a month, paid to them). You create the accounts Jori uses, and the setup page walks you through each one and tests it before saving.</p>
         <h4>Why</h4>
         <ul class="pro">
-          <li>Everything works, including iMessage and Notes on a Mac.</li>
+          <li>Everything works, including iMessage and Notes when it runs on a Mac.</li>
           <li>Your data stays on machines and accounts you own.</li>
         </ul>
         <h4>What it takes</h4>
         <ul class="con">
           <li>About 30–60 minutes of setup.</li>
-          <li>You keep the computer on.</li>
+          <li>A computer you keep on, or a rented server.</li>
         </ul>
         <div class="end">
-          <div class="term"><code id="install-cmd">curl -fsSL https://getjori.ai/install.sh | bash</code><button type="button" class="copy" data-copy="install-cmd" aria-label="Copy the install command">Copy</button></div>
+          <div class="dls">
+            <a class="btn" href="https://github.com/jori-ai/jori/releases/latest/download/Jori.dmg">Download for Mac</a>
+            <a class="btn" href="https://github.com/jori-ai/jori/releases/latest/download/JoriSetup.exe">Download for Windows</a>
+            <a class="btn quiet" href="/cloud">Rent a server</a>
+          </div>
           <div class="docs">
             <a href="https://github.com/jori-ai/jori/blob/main/docs/quickstart.md">Quickstart guide</a>
-            <a href="/#install">Other ways to install</a>
+            <a href="/#install">Terminal and other ways to install</a>
             <a href="/install.sh">Read the script</a>
           </div>
         </div>

@@ -45,7 +45,7 @@ JORI_INSTALL_TOOLS="$JORI_INSTALL${_jori_root_sub:+/$_jori_root_sub}"
 JORI_KERNEL_SUBDIR="$_jori_root_sub"
 if [ -z "${JORI_NODE:-}" ]; then
   JORI_NODE="$(command -v node 2>/dev/null || true)"
-  for _jori_root_n in /opt/homebrew/bin/node /usr/local/bin/node; do
+  for _jori_root_n in /opt/homebrew/bin/node /usr/local/bin/node "$HOME/.local/bin/node"; do
     [ -n "$JORI_NODE" ] && break
     [ -x "$_jori_root_n" ] && JORI_NODE="$_jori_root_n"
   done
