@@ -202,7 +202,8 @@ elif [[ -e $JORI_HOME && -n $(ls -A "$JORI_HOME" 2>/dev/null) ]]; then
   die "$JORI_HOME exists and isn't a Jori checkout. Move it, or set JORI_HOME to another folder."
 else
   mkdir -p "$(dirname "$JORI_HOME")"
-  git clone --quiet "$JORI_REPO" "$JORI_HOME" && ok "downloaded to $JORI_HOME"
+  git clone --quiet "$JORI_REPO" "$JORI_HOME" || die "Couldn't download Jori from $JORI_REPO. Check the network and run this again."
+  ok "downloaded to $JORI_HOME"
 fi
 
 note "installing its packages (a minute or two)…"
