@@ -168,6 +168,11 @@ Assign one label from the instance's label set (listed in the local additions un
 - **P2 (today):** Requires the user's reply within 24h
 - **P3 (FYI):** Newsletters, receipts, automated notifications — label and mark read
 
+**Two content P1s that need more than the one email (2026-11-23, from the strict-triage shadow week, where the live agent caught both and the one-shot did not):**
+
+- **Repeated account-security alerts.** Several sign-in, new-device, verification or password-reset alerts for one account within about an hour, that no sign-in the user or Jori itself started explains, can be someone trying to get in: P1, star, unread, and a ping asking whether it was them. A single alert keeps its usual priority, and so does a burst that Jori's own sign-in attempts at that site explain (Jori's sign-in log, `bin/login-log`; the strict one-shot reads it with `own_signins`, and the sender's recent mail with `sender_recent`).
+- **An email that contradicts the calendar.** When an email about a meeting or booking already on the user's calendar gives a different date, time, place or joining link than that event, and it is not the organizer's own change (which updates the event, § Bookings and Appointments), the user has to know which one to trust: P1, star, unread, and a ping naming both versions. Leave the event as it is.
+
 **Before settling on a priority, run Step 4a** — a reply to something the user sent is P1 no matter what the rules above or any fast-path below would have said.
 
 ### Step 4a: A reply to an email the user sent is ALWAYS P1 (added 2026-08-17)

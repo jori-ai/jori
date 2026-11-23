@@ -4,6 +4,9 @@
 //
 // Run: node --test tests/triage-route.test.mjs
 
+// First: a made-up installation, so the router's live re-read of
+// `gmail_triage_target` (localTriageTarget) never sees this checkout's own choice.
+import "./synthetic-instance.mjs";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { makeTriageRouter, triageTargetFromConfig } from "../agent/supervisor/triage-route.mjs";

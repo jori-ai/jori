@@ -9,9 +9,10 @@
 // child runs in the locked-down agent environment (lib/agent-env.cjs, id
 // "email-triage"); the tools read their own secrets.
 //
-// Called by agent/supervisor/triage-route.mjs when ops.gmailTriageTarget is
-// "strict". Never drops an email: exit 3 (no answer, a crash, a timeout, or no
-// triage action at all) tells the router to dispatch to ops-light as before,
+// Called by agent/supervisor/triage-route.mjs when the triage target is
+// "strict" (ops.gmailTriageTarget, or the installation's gmail_triage_target).
+// Never drops an email: exit 3 (no answer, a crash, a timeout, or no triage
+// action at all) tells the router to dispatch to ops-light as before,
 // with what this run already did.
 //
 // Usage: email-triage-run --payload <file> [--dry-run]
@@ -27,7 +28,7 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import { makeStatelessExecutor } from "../agent/core/stateless-executor.mjs";
 import { readOptional, sliceAll } from "../agent/supervisor/dispatch-preamble.mjs";
-import { TOOL_NAMES } from "../lib/email-triage-tools.mjs";
+import { TOOL_NAMES, intakeStamps } from "../lib/email-triage-tools.mjs";
 
 const require = createRequire(import.meta.url);
 const { MODELS } = require("../lib/models.cjs");
@@ -116,6 +117,7 @@ async function main() {
         env: {
           TRIAGE_MESSAGE_ID: String(p.messageId), TRIAGE_FROM: String(p.from || ""),
           TRIAGE_SUBJECT: String(p.subject || ""), TRIAGE_DATE: dateIso,
+          TRIAGE_STAMPS: intakeStamps(p.content).join(","),
           TRIAGE_STATE: stateFile, TRIAGE_DRY: DRY ? "1" : "0",
           HOME: os.homedir(), PATH: env.PATH || process.env.PATH,
         },
