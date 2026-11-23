@@ -29,7 +29,7 @@ test("comments, docstrings and exempted lines are skipped; real values are found
     'and more about Sam."""',
     'print("hi")  # Sam said so',
   ].join("\n"));
-  const out = JSON.parse(execFileSync(process.execPath, [SCAN, "--json"], { env: { ...process.env, JORI_HOME: home }, encoding: "utf8" }));
+  const out = JSON.parse(execFileSync(process.execPath, [SCAN, "--json"], { env: { ...process.env, JORI_HOME: home, JORI_LOCAL_DIR: path.join(home, "agent/local") }, encoding: "utf8" }));
   const by = Object.fromEntries(out.findings.map((f) => [f.key, f]));
   assert.deepEqual(by.assistant_name.files, ["bin/tool.mjs:6"]);
   assert.deepEqual(by.owner_name.files, ["bin/tool.mjs:7"]);

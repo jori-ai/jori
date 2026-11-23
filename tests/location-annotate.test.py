@@ -72,6 +72,7 @@ class NearbyVisit(unittest.TestCase):
         fake.__enter__.return_value = body
         with mock.patch.object(mod.urllib.request, "urlopen", return_value=fake), \
              mock.patch.dict(mod.__dict__, {
+                 "SUPABASE_URL": "https://example.supabase.co",
                  "get_key": lambda: "k",
                  "patch_row": lambda rid, patch: patched.append((rid, patch)) or True}):
             out = mod.resolve_nearby_visit(mod.datetime.fromisoformat(start), "Sam came over")

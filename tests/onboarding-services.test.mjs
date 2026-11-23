@@ -7,7 +7,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { SERVICES, connectService, servicesStatus, supabaseSaved, refFromUrl, configureSupabaseSignIn, configureSupabaseEmailCode, APP_REDIRECT } from "../lib/onboarding/services.mjs";
-import { encodePairing, decodePairing, buildPairing, PAIR_PREFIX } from "../lib/onboarding/pairing.mjs";
+import { encodePairing, decodePairing, buildPairing, ensureRelay, appDistribution, PAIR_PREFIX } from "../lib/onboarding/pairing.mjs";
 import { starterJobs, waitingJobs } from "../lib/onboarding/core.mjs";
 
 function checkout() {
@@ -119,6 +119,30 @@ test("the pairing code round-trips and carries no secret", async () => {
   assert.equal(d.t, "tok");
   assert.ok(!p.code.includes("svc") && !JSON.stringify(d).includes("svc"), "the service key never goes in the code");
   assert.match(p.svg, /^<svg/);
+});
+
+test("a new host on the shared app registers with the shared relay once", async () => {
+  const base = checkout();
+  fs.mkdirSync(path.join(base, "system"), { recursive: true });
+  const calls = [];
+  let cfg = null;
+  const relay = { relayConfig: () => cfg, registerInstance: async ({ relayUrl }) => { calls.push(relayUrl); cfg = { relay_url: relayUrl, instance_id: "in_x" }; return { relayUrl, instanceId: "in_x" }; } };
+  // no relay configured anywhere: nothing happens
+  assert.deepEqual(await ensureRelay(base, { relay, env: {} }), { registered: false });
+  fs.writeFileSync(path.join(base, "system", "app-distribution.json"), JSON.stringify({ push_relay_url: "https://push.example", testflight_url: "https://testflight.apple.com/join/abc" }));
+  assert.equal(appDistribution(base, {}).testflightUrl, "https://testflight.apple.com/join/abc");
+  assert.equal(appDistribution(base, { JORI_TESTFLIGHT_URL: "https://t.example" }).testflightUrl, "https://t.example");
+  assert.equal((await ensureRelay(base, { relay, env: {} })).registered, true);
+  assert.equal((await ensureRelay(base, { relay, env: {} })).already, true);
+  assert.deepEqual(calls, ["https://push.example"]);
+  // a host with its own Apple key keeps pushing directly
+  const own = checkout();
+  fs.mkdirSync(path.join(own, "system"), { recursive: true });
+  fs.writeFileSync(path.join(own, "system", "app-distribution.json"), JSON.stringify({ push_relay_url: "https://push.example" }));
+  fs.writeFileSync(path.join(own, "agent", "local", "config", "apns.json"), JSON.stringify({ key_id: "K", team_id: "T" }));
+  cfg = null;
+  assert.equal((await ensureRelay(own, { relay, env: {} })).direct, true);
+  assert.equal(calls.length, 1);
 });
 
 test("a starter job that needs a service waits for it", () => {

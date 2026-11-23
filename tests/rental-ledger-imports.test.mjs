@@ -50,7 +50,9 @@ function missingImports(source, spec, exports) {
   if (!imported) return [];
   // Strip the require statement itself, so the import list does not count as a use of its own names.
   const body = source.replace(new RegExp(String.raw`const\s*\{[^}]*\}\s*=\s*require\(\s*["']${esc(spec)}["']\s*\)`, "s"), "");
-  return exports.filter((name) => !imported.has(name) && new RegExp(String.raw`\b${name}\s*\(`).test(body));
+  // A name the file defines itself (`const has = …`, `function has(`) is its own, not the library's.
+  const ownDefinition = (name) => new RegExp(String.raw`(?:\b(?:const|let|var)\s+${name}\s*=|\bfunction\s+${name}\s*\()`).test(body);
+  return exports.filter((name) => !imported.has(name) && !ownDefinition(name) && new RegExp(String.raw`\b${name}\s*\(`).test(body));
 }
 
 const readers = () => {
@@ -86,6 +88,8 @@ test("the check catches a missing import and exempts a namespaced one", () => {
   const exports = ["statement", "contributionsOf"];
   const bad = `const { statement } = require("../lib/rental-ledger.js");\nstatement(); contributionsOf(t);`;
   assert.deepEqual(missingImports(bad, "../lib/rental-ledger.js", exports), ["contributionsOf"]);
+  const own = `const { statement } = require("../lib/rental-ledger.js");\nconst contributionsOf = (t) => t;\ncontributionsOf(t);`;
+  assert.deepEqual(missingImports(own, "../lib/rental-ledger.js", exports), [], "a name the file defines itself is not a missing import");
   const ns = `const ledger = require("../lib/rental-ledger.js");\nledger.contributionsOf(t);`;
   assert.ok(namespacedFrom(ns, "../lib/rental-ledger.js"));
   assert.deepEqual(missingImports(ns, "../lib/rental-ledger.js", exports), []);

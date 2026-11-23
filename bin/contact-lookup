@@ -17,7 +17,10 @@ import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 const contacts = require("../lib/contacts");
-const googleContacts = require("../lib/google-contacts.cjs");
+// Google write-through is optional: an installation without lib/google-contacts.cjs saves locally only.
+function googleContacts() {
+  try { return require("../lib/google-contacts.cjs"); } catch (e) { if (e.code === "MODULE_NOT_FOUND") return null; throw e; }
+}
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -236,7 +239,8 @@ Commands:
       } else {
         let meta = {};
         try { meta = JSON.parse(saved.metadata_json || "{}"); } catch {}
-        console.log(googleContacts.describe(googleContacts.syncToGoogle({ ...saved, address: meta.address || "" })));
+        const g = googleContacts();
+        console.log(g ? g.describe(g.syncToGoogle({ ...saved, address: meta.address || "" })) : "Google Contacts: skipped (not set up on this installation)");
       }
       break;
     }
