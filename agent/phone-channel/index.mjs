@@ -1512,16 +1512,25 @@ async function sweepMissedMessages() {
   }
 
   try {
-    const { data: missed } = await supabase
+    // Not filtered on `read`: the app marks the user's own row read as soon
+    // as realtime echoes it back (2026-11-22, a message sent with the app open
+    // was read=true within a second), so a `read=false` sweep could never
+    // recover a message the realtime path dropped, and the watchdog's restart
+    // did not help either. The cursor plus the picked-up stamp decide instead:
+    // a row a phone link already took carries `metadata.picked_up_at`. A
+    // stamped row that is still unread stays eligible, so a dispatch that
+    // failed (cursor not advanced) is retried as before.
+    const { data: rows, error } = await supabase
       .from("jori_messages")
       .select("*")
       .eq("role", "user")
-      .eq("read", false)
       .gt("created_at", lastSeenAt)
       .order("created_at", { ascending: true })
       .limit(10);
+    if (error) throw new Error(error.message);
+    const missed = (rows || []).filter((r) => !pendingMessages.has(r.id) && (!r.metadata?.picked_up_at || r.read === false));
 
-    if (missed && missed.length > 0) {
+    if (missed.length > 0) {
       console.error(`[phone-channel] Sweep found ${missed.length} missed message(s)`);
       for (const row of missed) {
         await handleIncomingMessage(row);

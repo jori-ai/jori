@@ -454,7 +454,10 @@ final class ChatViewModel: ObservableObject {
                             }
                             self.store.upsert(message)
                             self.backupToCloud()
-                            if isAppActive {
+                            // Only Claudette's rows: `read` on the user's own row is the
+                            // host's "not yet taken" flag, and marking it here hid
+                            // dropped messages from the host's catch-up sweep.
+                            if isAppActive && message.isAssistant {
                                 await self.markAsRead(messageId: message.id)
                             }
                         }
