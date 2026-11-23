@@ -3,7 +3,8 @@
 // Usage:
 //   contact-lookup search --name "Jon Barr" [--company "Acme"] [--domain "acme.com"] [--title "CEO"]
 //   contact-lookup enrich --name "Jon Barr" --domain "acme.com" [--email "jon@acme.com"]
-//   contact-lookup save --data '{"name":"Jon Barr","company":"Acme","email":"jon@acme.com"}'
+//   contact-lookup save --data '{"name":"Jon Barr","company":"Acme","email":"jon@acme.com"}' [--no-google]
+//     (also writes through to Google Contacts, no duplicates: lib/google-contacts.cjs)
 //   contact-lookup find "Jon Barr"
 //   contact-lookup get --name "Jon Barr"
 //   contact-lookup get --id 1
@@ -16,6 +17,10 @@ import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 const contacts = require("../lib/contacts");
+// Google write-through is optional: an installation without lib/google-contacts.cjs saves locally only.
+function googleContacts() {
+  try { return require("../lib/google-contacts.cjs"); } catch (e) { if (e.code === "MODULE_NOT_FOUND") return null; throw e; }
+}
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -65,7 +70,7 @@ function usage() {
 Commands:
   search --name <name> [--company X] [--domain X] [--title X]   Search Apollo for a person
   enrich --name <name> --domain <domain> [--email X]             Enrich via Apollo match
-  save --data '<json>'                                            Save/update a contact locally
+  save --data '<json>' [--no-google]                              Save/update a contact locally AND in Google Contacts
   find <query>                                                    Search local contacts (FTS5)
   get --name <name> | --id <id>                                   Get a specific contact
   list                                                            List all contacts
@@ -221,11 +226,22 @@ Commands:
         apolloId: data.apollo_id,
         notes: data.notes,
         tags: data.tags,
-        metadata: data.metadata,
+        metadata: data.address ? { ...(data.metadata || {}), address: data.address } : data.metadata,
       });
       const saved = contacts.get({ id });
       console.log(`Saved contact #${id}:`);
       console.log(formatContact(saved));
+      // Write through to Google Contacts (the address book the phone and Gmail read). The
+      // local save above stays; a Google failure never undoes it. The merged local row is
+      // what goes, so a re-save with fewer fields still carries what is already known.
+      if (args.includes("--no-google")) {
+        console.log("Google Contacts: skipped (--no-google)");
+      } else {
+        let meta = {};
+        try { meta = JSON.parse(saved.metadata_json || "{}"); } catch {}
+        const g = googleContacts();
+        console.log(g ? g.describe(g.syncToGoogle({ ...saved, address: meta.address || "" })) : "Google Contacts: skipped (not set up on this installation)");
+      }
       break;
     }
 

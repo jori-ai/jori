@@ -169,7 +169,9 @@ describe("log stream cleanup", () => {
         proc.stopping = false;
         proc._restartScheduled = false;
         proc.start();
-        await sleep(150); // Let it exit.
+        // Let it exit: node's own start-up takes longer than the 30 ms the mock
+        // lives on a loaded runner, so wait for the exit, bounded, not a fixed time.
+        for (const until = Date.now() + 3000; proc._logStream !== null && Date.now() < until;) await sleep(25);
         // Log stream should be cleaned up by exit handler.
         assert.equal(proc._logStream, null, `Cycle ${i}: _logStream should be null after exit`);
         proc.stop();

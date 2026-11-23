@@ -64,7 +64,8 @@ test("it keeps what claude and the agent's tools need", () => {
     }
     // gog runs through its shim, which reads the keyring password itself.
     assert.equal(env.GOG_KEYRING_PASSWORD, undefined);
-    const shims = path.join(ROOT, "bin", "shims");
+    // The shims are found under the install root (lib/root.cjs installTools), which a CI checkout reaches through ~/Dev/jori.
+    const shims = require("../lib/root.cjs").installTools("bin/shims");
     assert.equal(env.PATH, `${shims}:${PARENT.PATH}`);
     assert.equal(env.GOG_BIN, path.join(shims, "gog"));
   });

@@ -37,6 +37,7 @@ Issue all in a single parallel turn:
 11. `agent/logs/watchdog.log` grep `[hum:` — dispatch-level skip reasons
 12. Structural-validity scan of `hum-runs.jsonl` — count rows lacking `sonnet.decision` (legacy schema; ignore for metrics but count for completeness)
 13. `~/Dev/jori/bin/hum-resolve-first questions --since 7d --json --list` — questions the resolve-first gate answered from Jori's own records instead of asking (not sent / answered with an FYI), how many it still asked, how often its deeper look (mail, calendar dates, memory, the user's own words) settled one, and how many of its answers the user withdrew
+14. `~/Dev/jori/bin/coherence-check stats --since 7d --json` and `coherence-check tail -n 40` — how often the one-subject check kept, trimmed or split a message (by source: `hum-ping` vs `jori-send-curl`), what became of split-off parts (put through a send, lapsed), and the hum feedback rows that carry `coherence` (Step 2 #2) with their reactions
 
 ## Step 3 — Score every intent criterion
 
@@ -106,6 +107,7 @@ Commits touching hum itself. Registry diff vs last week. Intent-file edits. Purp
 - False-negative hunt: ticks where silent was chosen but a candidate had `urgency ≥ 0.75` — spot-check 3, quote `sonnet.rationale`, judge.
 - False-positive hunt: info pings that got 👎 or no reaction — quote rationale, propose why Sonnet misread.
 - Relevance check: sample 3 info pings; did the signal actually match `situation`?
+- **One subject per ping** (Step 2 #14): trim / split rate, and whether any ping the user reacted to badly still stapled a second subject on with a reason that did not follow (the check missed it: quote it). Sample 3 trims or splits from the tail: was the part taken off really unrelated, and did the kept text keep the main subject? A wrong trim is a lost fact; name it. If a lane keeps producing fused candidates, that lane's prompt needs the fix, not the check.
 
 ### 6e. Questions & memory growth
 - Answer rate + time-to-answer (Step 3).

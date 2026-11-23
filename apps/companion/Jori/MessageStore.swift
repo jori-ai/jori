@@ -181,13 +181,19 @@ final class MessageStore {
     /// switching back doesn't re-fetch from scratch.
     func sync(with freshMessages: [Message], conversation: String) {
         let freshIds = Set(freshMessages.map(\.id))
-        let descriptor = FetchDescriptor<CachedMessage>()
-        guard let cached = try? context.fetch(descriptor) else { return }
-
         if !runningBytesSeeded {
-            runningBytes = cached.reduce(0) { $0 + cost(for: $1.content) }
+            let all = (try? context.fetch(FetchDescriptor<CachedMessage>())) ?? []
+            runningBytes = all.reduce(0) { $0 + cost(for: $1.content) }
             runningBytesSeeded = true
         }
+        // Only this conversation's rows (and pre-conversation rows, which may
+        // belong to it), not the whole cache: this runs every 30 s on the
+        // main thread, and faulting in every cached row was most of its cost.
+        let target = conversation
+        let descriptor = FetchDescriptor<CachedMessage>(
+            predicate: #Predicate { $0.conversationId == target || $0.conversationId == nil }
+        )
+        guard let cached = try? context.fetch(descriptor) else { return }
 
         var existingById: [UUID: CachedMessage] = [:]
         var changed = false

@@ -27,11 +27,22 @@
  *       [--from <ISO with offset> --to <ISO with offset>]   the stretch it is about
  *       [--channel email] [--said-at <ISO>] [--source <message id>]
  *       [--reading "<your reading of it, one or two sentences>"]
+ *       [--arrival "<name>=<ISO with offset>"]   when a person the sentence says arrived did arrive
+ *                                                (repeatable; the name as it is on the user's companion records)
  *   day-correction list <YYYY-MM-DD>
  *   day-correction rm <YYYY-MM-DD> <n>                       1-based, as `list` numbers them
  *
+ * `--arrival` is how a stated arrival time reaches the day: a stop's header says
+ * "Sam (from 4:19pm)" from the first visit row that names a person, which is when the
+ * phone first logged them, and when the user says "Sam got here around 3:30" the
+ * header must say 3:30. The turn that read the sentence gives the instant (it is the
+ * one reading language); `daily-summary-build prep` replaces the row-derived time with
+ * it for a person already on the stop (lib/daily-summary-harvest.js
+ * applyCorrectionArrivals). It never adds a person to a stop: that is `location-annotate`.
+ *
  * `add` is idempotent on (date, text): the same sentence recorded twice is one
- * entry, so a re-dispatched email turn cannot double it.
+ * entry, so a re-dispatched email turn cannot double it. To add an arrival to a
+ * sentence already recorded, `rm` it and `add` it again with the flag.
  * After recording, re-render with `daily-summary-run <date>` (or `SILENT`).
  */
 "use strict";
@@ -68,6 +79,12 @@ function writeAll(date, rows) {
   fs.renameSync(tmp, file);
 }
 
+function allArgs(argv, name) {
+  const out = [];
+  argv.forEach((a, i) => { if (a === name && argv[i + 1] !== undefined) out.push(argv[i + 1]); });
+  return out;
+}
+
 function validIso(s) { return Number.isFinite(Date.parse(s)) && /(Z|[+-]\d{2}:?\d{2})$/.test(s); } // lang-regex-ok: checking an ISO timestamp carries an offset
 
 const [cmd, date, ...rest] = process.argv.slice(2);
@@ -77,7 +94,7 @@ if (!isDate(date)) die("second argument must be a YYYY-MM-DD date");
 if (cmd === "list") {
   const rows = readAll(date);
   if (!rows.length) { console.log(`(no corrections recorded for ${date})`); process.exit(0); }
-  rows.forEach((r, i) => console.log(`${i + 1}. [${r.channel}] ${r.applies_from ? `${r.applies_from} → ${r.applies_to}` : "no window"} — ${r.text}`));
+  rows.forEach((r, i) => console.log(`${i + 1}. [${r.channel}] ${r.applies_from ? `${r.applies_from} → ${r.applies_to}` : "no window"} — ${r.text}${r.arrivals ? ` [arrivals: ${Object.entries(r.arrivals).map(([n, t]) => `${n}=${t}`).join(", ")}]` : ""}`));
   process.exit(0);
 }
 
@@ -101,6 +118,15 @@ if (from && Date.parse(to) <= Date.parse(from)) die("--to must be after --from")
 const saidAt = arg(rest, "--said-at");
 if (saidAt && !validIso(saidAt)) die("--said-at must be an ISO timestamp with an offset");
 
+const arrivals = {};
+for (const a of allArgs(rest, "--arrival")) {
+  const cut = String(a).indexOf("=");
+  const who = cut > 0 ? a.slice(0, cut).trim() : "";
+  const when = cut > 0 ? a.slice(cut + 1).trim() : "";
+  if (!who || !validIso(when)) die("--arrival must be <name>=<ISO timestamp with an offset>, e.g. Sam=2026-10-10T15:30:00-04:00");
+  arrivals[who] = when;
+}
+
 const rows = readAll(date);
 if (rows.some((r) => r.text === text)) { console.log("already recorded — nothing to do"); process.exit(0); }
 rows.push({
@@ -110,6 +136,7 @@ rows.push({
   ...(from ? { applies_from: from, applies_to: to } : {}),
   ...(arg(rest, "--source") ? { source: arg(rest, "--source") } : {}),
   ...(arg(rest, "--reading") ? { reading: arg(rest, "--reading").trim() } : {}),
+  ...(Object.keys(arrivals).length ? { arrivals } : {}),
 });
 writeAll(date, rows);
 console.log(`recorded for ${date} (${rows.length} total)`);

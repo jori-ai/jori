@@ -63,6 +63,19 @@ Cloud-judged devices (any site):
               The entry's `lock` names which lock (none = the script's
               default); every lock is read in one subprocess per sweep.
 
+  ttlock_internet  a home with nothing of ours on its network but TTLock lock
+              gateways (Wi-Fi boxes that talk only to TTLock's cloud) is judged
+              by those gateways: its internet is up while ANY of the entry's
+              `gateways` (TTLock gateway ids) is online, and down when all of
+              them are offline. So one flaky gateway raises nothing, and a power
+              cut or a dead router reads the same as the line going down (to a
+              tenant it is the same outage). One `lock-health gateways --json`
+              per sweep (`ttlock_gateways_command` overrides the path) reads
+              the whole account; when it can't be read the entry is "not
+              judged", never DOWN. When every gateway on the account is offline
+              at once, the detail says TTLock itself is the likelier cause.
+              `lock-health gateways --where` lists the ids with their homes.
+
 Listed devices (a LAN we can't route to, behind a router in router mode):
 
   client_list judged by whether that router's own attached-devices page lists
@@ -400,6 +413,54 @@ def lock_cloud_states(cfg):
     except Exception:
         LOCKS["data"] = None
     return LOCKS["data"]
+
+
+TTLOCK_GW = {"data": "unfetched"}
+
+
+def ttlock_gateways(cfg):
+    """TTLock gateway id -> online (bool) for the whole account, or None when
+    the account couldn't be read. ONE `lock-health gateways --json` per sweep;
+    lock-health already holds the TTLock client id and borrows the hub's token."""
+    if TTLOCK_GW["data"] != "unfetched":
+        return TTLOCK_GW["data"]
+    TTLOCK_GW["data"] = None
+    cmd = expand(cfg.get("ttlock_gateways_command") or "bin/lock-health")
+    if not os.path.isabs(cmd):
+        cmd = os.path.join(TOOLS, cmd)
+    try:
+        r = subprocess.run([cmd, "gateways", "--json"], capture_output=True, text=True, timeout=90)
+        v = json.loads((r.stdout or "").strip().splitlines()[-1])
+        if isinstance(v, dict) and v.get("ok") and isinstance(v.get("gateways"), list):
+            TTLOCK_GW["data"] = {int(g["id"]): g.get("online") is True for g in v["gateways"] if isinstance(g, dict) and "id" in g}
+    except Exception:
+        TTLOCK_GW["data"] = None
+    return TTLOCK_GW["data"]
+
+
+def check_ttlock_internet(cfg, devs):
+    results = {}
+    if not devs:
+        return results
+    gws = ttlock_gateways(cfg)
+    everyone_off = bool(gws) and not any(gws.values())
+    for d in devs:
+        ids = [int(x) for x in d.get("gateways", [])]
+        if gws is None:
+            results[d["name"]] = (None, "TTLock cloud unavailable")
+            continue
+        known = [i for i in ids if i in gws]
+        if not known:
+            results[d["name"]] = (None, "none of its gateways are on the TTLock account")
+            continue
+        on = sum(1 for i in known if gws[i])
+        if on:
+            results[d["name"]] = (True, f"TTLock: {on} of {len(known)} gateways online")
+        elif everyone_off and len(gws) > len(known):
+            results[d["name"]] = (False, f"TTLock: all {len(known)} gateways offline, and so is every other gateway on the account: more likely TTLock itself than this internet")
+        else:
+            results[d["name"]] = (False, f"TTLock: all {len(known)} gateways offline")
+    return results
 
 
 def lock_cloud_result(cfg, d):
@@ -745,14 +806,15 @@ def check_all(cfg, state=None, addrs=None):
     good address)."""
     roster = cfg.get("devices", [])
     sites = cfg.get("sites", {})
-    RING["data"] = LOCKS["data"] = "unfetched"  # each sweep asks the clouds afresh
+    RING["data"] = LOCKS["data"] = TTLOCK_GW["data"] = "unfetched"  # each sweep asks the clouds afresh
     prior = {k: v for k, v in ((state or {}).get("devices") or {}).items() if isinstance(v, dict)}
     last_ip = {k: v["ip"] for k, v in prior.items() if v.get("ip")}
     down = {k for k, v in prior.items() if v.get("status") == "down"}
     results = {}
     ring = [d for d in roster if d.get("check") == "ring"]
     listed = [d for d in roster if d.get("check") == "client_list"]
-    rest = [d for d in roster if d.get("check") not in ("ring", "client_list")]
+    gateways = [d for d in roster if d.get("check") == "ttlock_internet"]
+    rest = [d for d in roster if d.get("check") not in ("ring", "client_list", "ttlock_internet")]
     for key, site in sites.items():
         devs = [d for d in rest if d["site"] == key]
         if not devs:
@@ -765,6 +827,7 @@ def check_all(cfg, state=None, addrs=None):
         if d["name"] not in results:
             results[d["name"]] = (None, f"site {d['site']!r} is not in the roster's sites")
     results.update(check_ring(cfg, ring))
+    results.update(check_ttlock_internet(cfg, gateways))
     # Last: a client list is read through its `via` device, judged above.
     results.update(check_client_lists(cfg, listed, results, down))
     return quiet_in_maintenance(cfg, results)

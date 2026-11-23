@@ -97,6 +97,7 @@ import { checkPingBudget, isLocalHistoryRow } from "../lib/ping-budget.mjs";
 import { recordQuestionSend, currentScale } from "../lib/question-pacing.mjs";
 import { alreadyTold, deliveryVerdict, latestFix, recordTold, rememberPending, PROXIMITY_M } from "../lib/local-history-ledger.mjs";
 import { readSidecar } from "../lib/hum-resolve-first.mjs";
+import { splitIdFromKey, consumeSplit } from "../lib/coherence-check.mjs";
 import { optionalBin } from "../lib/ext-hooks.mjs";
 
 import { installTools } from "../lib/root.cjs";
@@ -534,6 +535,44 @@ for (const url of mediaUrls(headlineMedia)) sendArgs.push("--media", url);
 // A location question rides as a tappable card (ChoicePrompt subject + options).
 if (headlineMedia && headlineMedia.choice) sendArgs.push("--choices-json", JSON.stringify(headlineMedia.choice));
 
+// ─── One subject per ping (bin/coherence-check) ─────────────────────────
+//
+// Before the ping is routed: does every reason it gives for putting two things
+// together actually follow? A part stapled on with a benefit that does not
+// follow (an errand at home "before you leave, it saves a trip back", attached
+// to an airport run) is taken off here, so the ping is routed on, and the user
+// reads, the one subject it keeps. A part worth telling on its own is queued
+// as its own `split` candidate for a later tick (lib/coherence-check.mjs).
+// Here rather than only in jori-send-curl because the route must be chosen on
+// the text that goes out; jori-send-curl is then told not to judge it again.
+// Not for a local explanation (`nearby`): one subject by construction, and
+// worth something only while the user is still standing there. Fails open: no
+// answer, or any error, and the ping goes out as written.
+let coherence = null;
+const COHERENCE_BIN = process.env.JORI_COHERENCE_CHECK_BIN || installTools("bin/coherence-check");
+if (!isLocalHistoryPing && fs.existsSync(COHERENCE_BIN)) {
+  // Started with this node (process.execPath), not the script's shebang: cron's
+  // PATH has no node.
+  const cr = spawnSync(process.execPath, [COHERENCE_BIN, "check"], {
+    input: JSON.stringify({
+      message, intent: sendIntent, lane, ping_id: pingId, source: "hum-ping",
+      ...(headlineMedia && headlineMedia.choice ? { choices: headlineMedia.choice } : {}),
+    }),
+    encoding: "utf8", timeout: 90000,
+  });
+  try { coherence = JSON.parse(String(cr.stdout || "").trim().split("\n").pop()); } catch { coherence = null; }
+  if (coherence && (coherence.action === "trim" || coherence.action === "split") && String(coherence.text || "").trim()) {
+    console.error(`hum-ping: coherence → ${coherence.action}: ${coherence.reason || ""}${coherence.split_id ? ` (split off as ${coherence.split_id})` : ""}`);
+    message = String(coherence.text);
+    // A custom banner described the original text.
+    const pb = sendArgs.indexOf("--push-body");
+    if (pb >= 0) sendArgs.splice(pb, 2);
+  }
+  if (coherence) sendArgs.push("--coherence-checked");
+} else if (isLocalHistoryPing) {
+  sendArgs.push("--coherence-checked"); // exempt here, so not judged downstream either
+}
+
 // ─── Which team member's conversation it belongs in ─────────────────────
 //
 // Hum is the coordinator's job, but a ping about money belongs with the member
@@ -571,6 +610,17 @@ if (sendResult.status !== 0) {
   if (sendResult.stdout) console.error(sendResult.stdout);
   if (sendResult.stderr) console.error(sendResult.stderr);
   process.exit(3);
+}
+
+// A part split off an earlier message (topic `split`) gets one chance: once it
+// has been through the send, whether it went out or a later gate held it, it
+// leaves the queue (lib/coherence-check.mjs § The split queue).
+{
+  const splitId = splitIdFromKey(findings && findings[0] && findings[0].dedup_key);
+  if (splitId) {
+    try { consumeSplit(splitId, { ping_id: pingId, by: "hum-ping" }); }
+    catch (e) { console.error(`hum-ping: WARNING — could not mark split ${splitId} consumed: ${e.message}`); }
+  }
 }
 
 let messageId = null;
@@ -674,6 +724,12 @@ if (isLocalHistoryPing) {
   try { recordTold({ ping_id: pingId, message_id: messageId, subject: localSubject, sent_at: entry.sent_at }); }
   catch (e) { console.error(`hum-ping: WARNING — local-history ledger write failed: ${e.message}`); }
   try { rememberPending({ message_id: messageId, ping_id: pingId, subject: localSubject }); } catch { /* best effort */ }
+}
+// The coherence check took a part off what went out (trim), or took it off and
+// queued it as its own candidate (split): ties the decision to the user's
+// reaction to this ping (hum-review § coherence check).
+if (coherence && coherence.decision_id && (coherence.action === "trim" || coherence.action === "split")) {
+  entry.coherence = { decision_id: coherence.decision_id, action: coherence.action, ...(coherence.split_id ? { split_id: coherence.split_id } : {}) };
 }
 // The resolve-first gate rewrote what went out: into a short FYI (the records
 // answered it) or into just the remaining gap. hum-review reads this.

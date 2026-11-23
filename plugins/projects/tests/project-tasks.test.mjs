@@ -191,7 +191,7 @@ test("the page's Tasks section is written by code and goes after What you might 
   pt.recordWork(l, j.id, { kind: "doc", link: "https://docs.example/1", summary: "Six places" }, { now: NOW });
   const md = pt.renderTasksSection(l, "p", { now: NOW });
   assert.match(md, /^## Tasks\n- \[ \] Shortlist restaurants · Jori · due 2026-11-12/);
-  assert.match(md, /\n- \[ \] Book the restaurant for the anniversary · \S+ · due 2027-02-01 · pt-/);
+  assert.match(md, /\n- \[ \] Book the restaurant for the anniversary · [^·\n]+ · due 2027-02-01 · pt-/);
   assert.ok(md.includes("Jori's doc is ready for review (https://docs.example/1)"));
   const section = "## Goal\nG\n\n## What you might need\n- x\n\n## Tasks\n- stale\n\n## Coming up\n- y";
   const out = pt.injectTasks(section, md);

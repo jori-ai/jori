@@ -894,6 +894,33 @@ test("bursts: a few steps just before a walk do not stretch it, and tiny batches
   assert.equal(stepBursts(stepSeries([one(at(9), at(9, 1), 18, WATCH), one(at(9, 5), at(9, 6), 30, WATCH)]), cfg()).length, 0);
 });
 
+test("bursts: moving about a house at a slow cadence is not a walk; a stroll with stops is", () => {
+  // 16 a minute then 23 a minute (a Watch counting room to room): no burst
+  const about = stepSeries([one(at(9), at(9, 10), 160, WATCH), one(at(9, 10), at(9, 20), 230, WATCH)]);
+  assert.equal(stepBursts(about, cfg()).length, 0);
+  // 35 a minute for ten minutes: a burst
+  assert.equal(stepBursts(stepSeries([one(at(9), at(9, 10), 350, WATCH)]), cfg()).length, 1);
+  assert.equal(SILENT_GAP_DEFAULTS.burst_steps / SILENT_GAP_DEFAULTS.burst_window_min, 30);
+});
+
+test("the phone put down while the Watch counts a slow twenty minutes about the house: the stay is not cut", () => {
+  const stop = homeStop(at(7), at(18));
+  const pings = fixesAround(at(7), at(11, 30), at(13, 5), at(18));
+  const phoneUse = [one(at(11, 0), at(11, 1), 25, PHONE), one(at(13, 10), at(13, 11), 25, PHONE)];
+  const about = [...phoneUse, one(at(12, 27), at(12, 38), 160, WATCH), one(at(12, 39), at(12, 49), 230, WATCH)];
+  for (const phone_sources of [[], [PHONE]]) {
+    const r = splitStopsOnMovedSilence([stop], pings, about, { config: cfg({ phone_sources }), hm });
+    assert.equal(r.stops.length, 1, JSON.stringify(r.silences));
+    assert.ok(!r.stops.some(s => s.moved_place_unknown), "no place-unknown stop, so nothing to ask about");
+    assert.equal(r.silences.find(x => x.from_ms === at(11, 30)).verdict, "still");
+    // the same twenty minutes at a stroll's cadence is a walk the phone sat out, as ever
+    const stroll = [...phoneUse, one(at(12, 27), at(12, 49), 700, WATCH)];
+    const s = splitStopsOnMovedSilence([stop], pings, stroll, { config: cfg({ phone_sources }), hm });
+    assert.equal(s.silences.find(x => x.from_ms === at(11, 30)).verdict, "moved");
+    assert.ok(s.stops.some(x => x.moved_place_unknown));
+  }
+});
+
 test("silentGapConfig: the defaults stand when the installation sets nothing usable", () => {
   const c = silentGapConfig({ gap_min: "x", burst_steps: 200, phone_sources: "nope" });
   assert.equal(c.gap_min, SILENT_GAP_DEFAULTS.gap_min);
@@ -972,5 +999,100 @@ test("JORI_MOVED_SILENCE_AWAY_END=0 ends the span at the last walk of any kind a
     assert.equal(`${hm(m.start_ts_ms)}-${hm(m.end_ts_ms)}`, `${hm(at(23, 1))}-${hm(at(23, 38))}`);
   } finally {
     if (prev === undefined) delete process.env.JORI_MOVED_SILENCE_AWAY_END; else process.env.JORI_MOVED_SILENCE_AWAY_END = prev;
+  }
+});
+
+// A walk block that is the leg's own window: the spine keeps a walking leg across the window of a
+// loop out from the house and back, and the steps' walk begins before the block and ends after it.
+// Only the stops beside the block moved, so the email drew a "Walked" line, the block and a
+// "between stops" line for one outing, with the route counted twice.
+// (The edges carry odd seconds on purpose: the block must pass the "half inside the leg" test
+// against its own window after the first stop has widened it, not only at exactly half.)
+function blockAmidLeg(blockEnd = [18, 23], legEnd = [18, 23]) {
+  return {
+    date: "2026-03-02", tz: day().tz, map_url: "https://example.invalid/map.png",
+    stops: [
+      { id: "h1", start: "00:00", end: "18:10", start_ts_ms: at(0), end_ts_ms: at(18, 10) + 9883, duration_min: 1090, place: { name: "Home" } },
+      { id: "w", start: "18:10", end: "18:23", start_ts_ms: at(18, 10) + 9883, end_ts_ms: at(...blockEnd) + 18000, duration_min: 13,
+        place: { name: "Evening walk", source: "excursion" }, provenance: { excursion: true },
+        excursion: { from_base: "Home", mode: "walking", routed_m: 543, away_m: 260, loop_in_gap: true, home_loop: true } },
+      { id: "h2", start: "18:23", end: "23:59", start_ts_ms: at(18, 23) + 18000, end_ts_ms: at(23, 59), duration_min: 336, place: { name: "Home" } },
+    ],
+    travel_legs: [{ from: "h1", to: "w", duration_min: 0, distance_km: 0.26 }, { from: "w", to: "h2", duration_min: 0, distance_km: 0.26 }],
+    path: { stats: {}, segments: [], spine: [
+      { type: "leg", id: "l0", mode: "walking", median_kmh: 2.5, start_ms: at(18, 10) + 9883, end_ms: at(...legEnd) + 18000, mins: 13,
+        routed_m: 543, walked_m: 543, geometry: "map_matched", fixes: 2 },
+    ] },
+    routes: [],
+  };
+}
+const blockWalk = (a, b) => [...readings(at(0, 5), at(0, 10), 2), ...readings(a, b, 76), ...readings(at(23, 50), at(23, 55), 2)];
+
+test("a walk block the walking leg runs under takes the steps' walk edges with the stops beside it, so the outing is one line", () => {
+  const d = blockAmidLeg();
+  const st = annotateDaySteps(d, blockWalk(at(17, 57), at(18, 25)), null, { startMs: at(0), endMs: at(24) });
+  assert.deepEqual(d.stops.map(s => [s.start, s.end]), [["00:00", "17:57"], ["17:57", "18:25"], ["18:25", "23:59"]]);
+  assert.deepEqual(d.travel_legs.map(t => t.duration_min), [0, 0]);
+  assert.deepEqual(st.stops_aligned.map(m => [m.stop_id, m.edge]).sort(), [["h1", "end"], ["h2", "start"], ["w", "end"], ["w", "start"]]);
+  assert.equal(d.stops[1].excursion.steps, 28 * 76, "the block's count is the whole walk's");
+  const text = plain(buildSkeleton(d));
+  assert.doesNotMatch(text, /Walked [\d.]+ miles/, text);
+  assert.doesNotMatch(text, /between stops/, text);
+  assert.match(text, /5:57pm · Evening walk/, text);
+});
+
+test("a walk block that only touches the leg, or sits mostly outside it, keeps its own edges", () => {
+  // the leg is the first five minutes of a thirty-minute block: it is not the block's own window
+  const d = blockAmidLeg([18, 40], [18, 15]);
+  annotateDaySteps(d, blockWalk(at(18), at(18, 15)), null, { startMs: at(0), endMs: at(24) });
+  assert.equal(d.stops[0].end, "18:00", "the stop left still follows the walk");
+  assert.equal(d.stops[1].start, "18:10", "the block that is not the leg's window does not");
+});
+
+test("JORI_STEPS_ALIGN_BLOCK=0 leaves the block's edges where the phone put them", () => {
+  const prev = process.env.JORI_STEPS_ALIGN_BLOCK;
+  process.env.JORI_STEPS_ALIGN_BLOCK = "0";
+  try {
+    const d = blockAmidLeg();
+    annotateDaySteps(d, blockWalk(at(17, 57), at(18, 25)), null, { startMs: at(0), endMs: at(24) });
+    assert.deepEqual(d.stops.map(s => [s.start, s.end]), [["00:00", "17:57"], ["18:10", "18:23"], ["18:25", "23:59"]]);
+  } finally {
+    if (prev === undefined) delete process.env.JORI_STEPS_ALIGN_BLOCK; else process.env.JORI_STEPS_ALIGN_BLOCK = prev;
+  }
+});
+
+// A loop out and back over a stretch the phone was silent has a route the router drew between the
+// points it did see: the least the walk covered. Printed beside a step count no walker's stride
+// joins to it ("0.3 mi · 2,122 steps", 0.26 m a step) it read as a mistake, and the reviewer held
+// the day; the steps' floor is the distance then, said "at least".
+test("a loop over a silent stretch whose steps outrun its route prints the steps' floor, said at least, and the header says so", () => {
+  const d = blockDay({ routed_m: 543, loop_in_gap: true, steps: 2122 });
+  const block = d.stops[1];
+  const r = excursionDistance(block, d);
+  assert.equal(Math.round(r.m), Math.round(2122 * 0.45));
+  assert.equal(r.floor, true);
+  assert.equal(r.estimated, true);
+  const info = {};
+  printedWalkMeters(d, d.stops, info);
+  assert.equal(info.floor, true);
+  assert.match(plain(stopHeaderHtml(block, d)), /Walk along the river · at least 0\.6 mi · 2,122 steps/);
+  assert.match(buildSkeleton(d), /at least [\d.]+ miles walked/);
+  assert.match(buildMarkdown(d), /Walk along the river\*\* · at least 0\.6 mi/);
+});
+
+test("a gap loop the steps do not outrun, and a block the phone traced, keep their route; JORI_GAP_LOOP_STEPS_FLOOR=0 restores it", () => {
+  const long = blockDay({ routed_m: 1200, loop_in_gap: true, steps: 2122 });
+  assert.deepEqual(excursionDistance(long.stops[1], long), { m: 1200, estimated: false });
+  const traced = blockDay({ routed_m: 543, steps: 2122 });
+  assert.deepEqual(excursionDistance(traced.stops[1], traced), { m: 543, estimated: false });
+  const few = blockDay({ routed_m: 543, loop_in_gap: true, steps: 90 });
+  assert.deepEqual(excursionDistance(few.stops[1], few), { m: 543, estimated: false });
+  const prev = process.env.JORI_GAP_LOOP_STEPS_FLOOR;
+  process.env.JORI_GAP_LOOP_STEPS_FLOOR = "0";
+  try {
+    const off = blockDay({ routed_m: 543, loop_in_gap: true, steps: 2122 });
+    assert.deepEqual(excursionDistance(off.stops[1], off), { m: 543, estimated: false });
+  } finally {
+    if (prev === undefined) delete process.env.JORI_GAP_LOOP_STEPS_FLOOR; else process.env.JORI_GAP_LOOP_STEPS_FLOOR = prev;
   }
 });

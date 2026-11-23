@@ -100,6 +100,8 @@ final class ChatViewModel: ObservableObject {
     private var catchUpTimer: Task<Void, Never>?
     /// What `backupToCloud` last wrote, so an unchanged conversation isn't rewritten.
     private var lastCloudBackup: [Message] = []
+    /// The last server response written to the cache, per conversation.
+    private var lastSynced: [String: [Message]] = [:]
     private var staleRetryTask: Task<Void, Never>?
     private var isLoadingMessages = false
     private let locationManager = LocationManager.shared
@@ -254,7 +256,14 @@ final class ChatViewModel: ObservableObject {
                     // ordering correct across the merge.
                     let merged = (response + inMemoryNewer)
                         .sorted { $0.createdAt < $1.createdAt }
-                    self.messages = merged
+                    // In memory usually holds more than the newest 500 (the
+                    // cache, "load earlier"), so this branch runs on nearly
+                    // every 30 s catch-up. Reassigning an identical array
+                    // still redrew the whole conversation on the main thread:
+                    // the Mac's remaining ~0.3 s hang every 30-40 s.
+                    if merged != self.messages {
+                        self.messages = merged
+                    }
                 }
             } else if self.messages.isEmpty, channel == ConversationID.coordinator,
                       let restored = cloudBackup.restore(), !restored.isEmpty {
@@ -265,7 +274,13 @@ final class ChatViewModel: ObservableObject {
             }
 
             pickupWatch.observe(response)
-            self.isWaitingForResponse = messages.last.map { $0.isUser && !notPickedUp.contains($0.id) } ?? false
+            // Assign @Published state only when it changes: every assignment,
+            // even of the same value, fires objectWillChange and re-runs the
+            // whole conversation view. In the chat (thousands of messages in
+            // memory) those three no-op writes per 30 s catch-up were the
+            // Mac's remaining ~0.3 s hang every 31 s (build 186, 2026-11-22).
+            let waiting = messages.last.map { $0.isUser && !notPickedUp.contains($0.id) } ?? false
+            if isWaitingForResponse != waiting { self.isWaitingForResponse = waiting }
 
             // Fresh install (no cache): the 3-day backfill is historical —
             // mark ALL as read immediately so they don't trigger push
@@ -280,15 +295,19 @@ final class ChatViewModel: ObservableObject {
             // Always reconcile the cache with a successful server response,
             // even if the in-memory array hasn't visibly changed — guarantees
             // the persistent store can never silently drift out of sync.
-            if !response.isEmpty {
+            // Skipped when the server sent exactly what was last synced (the
+            // usual catch-up): sync fetches the conversation's cached rows and
+            // compares all 500 on the main thread.
+            if !response.isEmpty, lastSynced[channel] != response {
                 store.sync(with: response, conversation: channel)
+                lastSynced[channel] = response
                 backupToCloud()
             }
 
             // Refresh succeeded — clear any stale-state error, drop offline
             // indicator, and stop the self-healing retry loop if running.
-            self.error = nil
-            self.isOffline = false
+            if self.error != nil { self.error = nil }
+            if self.isOffline { self.isOffline = false }
             staleRetryTask?.cancel()
             staleRetryTask = nil
 

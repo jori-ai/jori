@@ -36,6 +36,13 @@ function tmp(prefix = "local-rules-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
+// Every joined rules file opens with the agent's identity (lib/instance.cjs
+// identityBlock: its name and pronouns), whatever local/ holds. These helpers
+// take it off, so the assertions below are about the local rules themselves.
+const IDENTITY = /^## Who you are\n\n[^\n]*\n(?:You were earlier called [^\n]*\n)?/;
+const rulesOf = (t) => (IDENTITY.test(t) ? t.replace(IDENTITY, "").replace(/^\n/, "") : t);
+const identityOnly = (t) => IDENTITY.test(t) && rulesOf(t) === "";
+
 function argValue(args, flag) {
   const i = args.indexOf(flag);
   return i >= 0 ? args[i + 1] : undefined;
@@ -50,7 +57,8 @@ test("shared.md + <role>.md are joined, in that order, into <state>/local-rules.
   fs.writeFileSync(path.join(local, "chat.md"), "# Local rules — chat\n\nC1\n");
   const ops = buildLocalRulesFile({ localDir: local, role: "ops", stateDir: state });
   assert.equal(ops.path, path.join(state, LOCAL_RULES_FILE));
-  assert.equal(fs.readFileSync(ops.path, "utf8"), "# Local rules — shared\n\nS1\n\n# Local rules — ops\n\nO1\n");
+  assert.match(fs.readFileSync(ops.path, "utf8"), IDENTITY);
+  assert.equal(rulesOf(fs.readFileSync(ops.path, "utf8")), "# Local rules — shared\n\nS1\n\n# Local rules — ops\n\nO1\n");
   assert.equal(ops.content, fs.readFileSync(ops.path, "utf8"));
   const chatState = tmp();
   const chat = buildLocalRulesFile({ localDir: local, role: "chat", stateDir: chatState });
@@ -58,24 +66,23 @@ test("shared.md + <role>.md are joined, in that order, into <state>/local-rules.
   assert.doesNotMatch(fs.readFileSync(chat.path, "utf8"), /O1/);
 });
 
-test("a missing or blank file is skipped; no local rules at all → no file, path null", () => {
+test("a missing or blank file is skipped; no local rules at all → the identity alone", () => {
   const local = tmp(); const state = tmp();
   fs.writeFileSync(path.join(local, "shared.md"), "only shared\n");
   fs.writeFileSync(path.join(local, "ops.md"), "  \n\n");
-  assert.equal(readLocalRules({ localDir: local, role: "ops" }), "only shared\n");
+  assert.equal(rulesOf(readLocalRules({ localDir: local, role: "ops" })), "only shared\n");
   const r = buildLocalRulesFile({ localDir: local, role: "ops", stateDir: state });
-  assert.equal(fs.readFileSync(r.path, "utf8"), "only shared\n");
+  assert.equal(rulesOf(fs.readFileSync(r.path, "utf8")), "only shared\n");
 
-  // Empty local dir: nothing to append, and the stale file from before is gone.
+  // Empty local dir: only the identity is left to append.
   fs.rmSync(path.join(local, "shared.md"));
   const none = buildLocalRulesFile({ localDir: local, role: "ops", stateDir: state });
-  assert.equal(none.path, null);
-  assert.equal(none.content, "");
-  assert.equal(fs.existsSync(path.join(state, LOCAL_RULES_FILE)), false);
+  assert.ok(identityOnly(none.content), "no local rules → the identity alone");
+  assert.equal(fs.readFileSync(none.path, "utf8"), none.content);
 
-  // No local dir at all.
+  // No local dir at all: the same.
   const gone = buildLocalRulesFile({ localDir: path.join(local, "nope"), role: "chat", stateDir: state });
-  assert.equal(gone.path, null);
+  assert.ok(identityOnly(gone.content));
 });
 
 test("the file is rewritten only when its content changes (stable bytes for the prompt cache)", () => {
@@ -89,7 +96,7 @@ test("the file is rewritten only when its content changes (stable bytes for the 
   fs.writeFileSync(path.join(local, "shared.md"), "rule B\n");
   const second = buildLocalRulesFile({ localDir: local, role: "ops", stateDir: state });
   assert.equal(second.path, first.path, "same stable path");
-  assert.equal(fs.readFileSync(second.path, "utf8"), "rule B\n");
+  assert.equal(rulesOf(fs.readFileSync(second.path, "utf8")), "rule B\n");
 });
 
 // ---- the claude argv -----------------------------------------------------------
@@ -202,17 +209,19 @@ async function spawnedArgs({ supervisor, localFiles }) {
 }
 
 for (const supervisor of ["chat", "ops"]) {
-  test(`${supervisor} supervisor: claude gets --append-system-prompt-file with shared + ${supervisor} rules, and none when local/ is empty`, async (t) => {
+  test(`${supervisor} supervisor: claude gets --append-system-prompt-file with shared + ${supervisor} rules, and the identity alone when local/ is empty`, async (t) => {
     if (!(await canListen())) { t.skip("cannot bind a local port here"); return; }
     const files = { "shared.md": "# shared\nSHARED-RULE\n", "chat.md": "# chat\nCHAT-RULE\n", "ops.md": "# ops\nOPS-RULE\n" };
     const { args, state } = await spawnedArgs({ supervisor, localFiles: files });
     const p = argValue(args, "--append-system-prompt-file");
     assert.equal(p, path.join(state, "local-rules.md"));
     const text = fs.readFileSync(p, "utf8");
-    assert.equal(text, `# shared\nSHARED-RULE\n\n# ${supervisor}\n${supervisor.toUpperCase()}-RULE\n`);
+    assert.equal(rulesOf(text), `# shared\nSHARED-RULE\n\n# ${supervisor}\n${supervisor.toUpperCase()}-RULE\n`);
 
+    // local/ empty: the file carries the identity alone.
     const empty = await spawnedArgs({ supervisor, localFiles: {} });
-    assert.equal(empty.args.includes("--append-system-prompt-file"), false);
+    const emptyFile = argValue(empty.args, "--append-system-prompt-file");
+    assert.ok(emptyFile && identityOnly(fs.readFileSync(emptyFile, "utf8")));
   });
 }
 
@@ -387,7 +396,8 @@ test("local-rules.sh: the joined rules file is byte-identical to the supervisors
     const out = path.join(home, `rules-${role}.md`);
     const r = bash(`jori_local_rules_file ${role} ${JSON.stringify(out)}; echo rc=$?`, { HOME: home });
     assert.match(r.stdout, /rc=0/);
-    assert.equal(fs.readFileSync(out, "utf8"), readLocalRules({ localDir: local, role }), role);
+    // The fixture root has no lib/instance.cjs, so the shell twin writes no identity block here.
+    assert.equal(rulesOf(fs.readFileSync(out, "utf8")), rulesOf(readLocalRules({ localDir: local, role })), role);
   }
   // nothing to append → rc 1 and no file left behind
   const empty = tmp("local-rules-empty-");
@@ -448,7 +458,7 @@ for (const runner of ["run-ephemeral-opus.sh", "run-ephemeral-fable.sh"]) {
     });
     assert.equal(r.status, 0, r.stderr + fs.readFileSync(path.join(root, "agent/logs/demo-job.log"), "utf8"));
     assert.equal(fs.readFileSync(path.join(home, "stdin"), "utf8"), "TASK LINE\n\n# Demo job\nKERNEL STEP\n\n## Local additions — demo-job\nLOCAL STEP\n");
-    assert.equal(fs.readFileSync(path.join(home, "appended"), "utf8"), readLocalRules({ localDir: local, role: "ops" }));
+    assert.equal(rulesOf(fs.readFileSync(path.join(home, "appended"), "utf8")), rulesOf(readLocalRules({ localDir: local, role: "ops" })));
     const argv = fs.readFileSync(path.join(home, "argv"), "utf8").split("\n");
     assert.ok(argv.includes("--append-system-prompt-file"));
     // the temp rules file is cleaned up

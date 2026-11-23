@@ -132,12 +132,20 @@ if (artGate.suppress) {
 
 // Emit the first unseen item (check signal dedup via state elsewhere if needed).
 // For now, emit the top candidate — Sonnet ranker dedups against recent runs.
-const top = items[0];
+// Prefer the soonest-ending show that has not ended yet; ISO end dates are
+// structured data, so a plain Date comparison is enough here.
+const todayMs = Date.parse(new Date().toISOString().slice(0, 10));
+const endMs = (item) => {
+  const t = /^\d{4}-\d{2}-\d{2}$/.test(item.ends || "") ? Date.parse(item.ends) : NaN; // lang-regex-ok: ISO date structure
+  return Number.isNaN(t) || t < todayMs ? Infinity : t;
+};
+const top = items.reduce((best, item) => (endMs(item) < endMs(best) ? item : best), items[0]);
+const endsSoon = endMs(top) - todayMs <= 7 * 86400000;
 stampRun("art", true);
 emit({
   topic: "art",
   signal: `${top.title} @ ${top.venue}${top.ends ? " (ends " + top.ends + ")" : ""} — ${top.why || ""}`,
-  urgency: 0.4,
+  urgency: endsSoon ? 0.55 : 0.4,
   freshness_min: cache._age_min || 0,
   dedup_key: `art:${(top.url || top.title || "").slice(0, 60)}`,
   supporting_data: { candidate: top, others: items.slice(1, 4) },

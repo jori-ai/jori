@@ -138,6 +138,13 @@ if (memo && memo.hash === memoHash && memo.emit === false) {
 // reject most ticks. The output schema is rigid so we can parse without
 // re-reading the model.
 //
+// One subject per candidate (2026-11-21). This lane once emitted an airport
+// pickup and an unrelated item due the same day as ONE candidate, joined by a
+// benefit that did not follow (do the second "before you go, it saves a trip"),
+// and every later gate passed it because each fact was true. The prompt now
+// says a candidate has one anchor and a link must change what the user would
+// do; bin/coherence-check enforces it at send time.
+//
 // Class C needs a new fact (2026-10-09). Requirement: never send progress-free
 // nudges for items the user is actively working on. Of the 7 SHOULD pings sent
 // over four months, the 6 that only said "X is due, you're free now" drew no
@@ -162,6 +169,8 @@ REJECT (emit null) when:
 - The anchor is an event the user has already prepped for or done (check LEARNINGS)
 - The 'should-be-doing' commitment can't be matched to a specific calendar window
 - All a SHOULD would say is that an item on the user's own task list (or a commitment the user made) is due, overdue or still open and that the user has time free now. The user keeps their own list and knows what is on it; "X is due today and you have an hour, good time to do it" is a progress-free reminder the user has said adds nothing. A SHOULD must carry a fact the user may not have.
+
+ONE SUBJECT. The candidate is about ONE anchor. Never attach a second, separate item to it (another task, item or event) with a claimed reason or benefit ("so", "before you go", "while you're at it", "saves a trip") or a bare "too" / "also". Ask whether the user would act differently because of the link; it is allowed only when the facts make it true: the second thing is on the route, one really frees or blocks the other, or both belong to the same trip, booking or decision. If two separate things are timely, emit the more timely one alone; the other reaches the user through its own lane. (A send-time check takes off any part whose link does not follow, but the candidate should never need it.)
 
 Output a strict JSON object — pick exactly one shape, no prose, no markdown:
 

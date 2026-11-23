@@ -39,6 +39,7 @@ import { loadTimeline, checkClaims } from "../../lib/claim-facts.mjs";
 import { buildIntent } from "../../lib/hum-intent.mjs";
 import { preRankFilter } from "../../lib/hum-vetoes.mjs";
 import { orderQuestionsFirst, questionBacklog, pacingScale, questionSlotBusy } from "../../lib/question-pacing.mjs";
+import { splitCandidates, SPLIT_TOPIC } from "../../lib/coherence-check.mjs";
 import { createRequire } from "node:module";
 
 import { installTools } from "../../lib/root.cjs";
@@ -361,6 +362,31 @@ async function main() {
   }));
 
   const candidates = results.filter((r) => r.candidate).map((r) => r.candidate);
+  // What the lanes themselves produced, before the split queue adds its part:
+  // the empty/all-failed telemetry below is about the lanes.
+  const laneCandidateCount = candidates.length;
+
+  // A part the coherence check took off an earlier message because it was
+  // stapled to an unrelated subject, and judged worth telling on its own
+  // (lib/coherence-check.mjs § The split queue). Not a registry lane: it is
+  // offered as one more candidate (topic `split`, the newest waiting part)
+  // until hum-ping has put it through a send or its day ends, and goes through
+  // every check below like any other. Never in preview mode: the idle gate
+  // (lib/jev-hum-gate.mjs) wakes a hum turn whenever a preview finds anything
+  // eligible, and a part the ranker keeps declining would then wake one on
+  // every idle check until midnight. So it rides along only on turns that run
+  // anyway. A restricted harvest (--topic, HUM_ONLY_LANES) offers it only when
+  // it names `split`. Fail-open: an unreadable queue offers nothing.
+  let splitOffered = 0;
+  if (!preview && (!onlyTopic || onlyTopic === SPLIT_TOPIC) && (!onlyLanes.size || onlyLanes.has(SPLIT_TOPIC))) {
+    try {
+      const split = splitCandidates({ max: 1 });
+      candidates.push(...split);
+      splitOffered = split.length;
+    } catch (e) {
+      console.error(`hum-harvest-all: split queue unreadable (fail-open): ${e.message}`);
+    }
+  }
 
   // Deterministic feedback-weighting: scale DISCRETIONARY-lane
   // candidates' urgency by the user's engagement (hum-engagement.mjs) before the
@@ -432,7 +458,7 @@ async function main() {
   // expected) from "harvest pipeline broken" (REAL errors dominate, candidates
   // empty by failure not by signal). all_failed now keys off genuine errors
   // only — a quiet tick where everything no-op'd is no longer "all failed".
-  const harvestEmpty = candidates.length === 0 && toRun.length > 0;
+  const harvestEmpty = laneCandidateCount === 0 && toRun.length > 0;
   const allFailed = harvestEmpty && errors.length > 0 && errors.length === toRun.length;
 
   // ─── Claim-check every candidate against the authorities ────────────────
@@ -581,6 +607,7 @@ async function main() {
       question_backlog: backlog.total,
       question_backlog_lanes: backlog.lanes,
       question_scale: pacingScale(backlog.total),
+      split_offered: splitOffered,
       eligible_count: candidates.length,
       no_eligible: noEligible,
       perishable_no_local: perishableNoLocal,

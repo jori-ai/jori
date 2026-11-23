@@ -46,11 +46,11 @@ export function tools({ BIN, run }) {
     },
     {
       name: "contact_save",
-      description: "Save or update a contact in the local contacts database. Upserts by name+company or apollo_id.",
+      description: "Save or update a contact in the local contacts database (upserts by name+company or apollo_id) AND write it through to Google Contacts: an existing Google contact with the same email, phone or name is updated (only its empty fields are filled), otherwise a new one is created, so it never duplicates. The output's last line says what happened in Google.",
       schema: {
         type: "object",
         properties: {
-          data: { type: "string", description: "JSON string with contact fields: name, email, phone, company, title, linkedin_url, apollo_id, notes, tags, metadata" },
+          data: { type: "string", description: "JSON string with contact fields: name, email, phone, company, title, linkedin_url, apollo_id, notes, tags, address, metadata" },
         },
         required: ["data"],
       },

@@ -4,7 +4,9 @@
 # No cron line of its own: an installation runs it from a recurring tick (e.g.
 # trigger-context-sync.sh's */30 one, through its _ext/context-sync-tick.sh hook).
 #
-# From cron (no argument): code only. `call-log pending` reads Zoom's list of
+# From cron (no argument): code only. Also sends the day's follow-up of open
+# action items when one is due (`call-log followup`, code only).
+# `call-log pending` reads Zoom's list of
 # the user's room(s) and the Zoom summary emails (keys from secrets and .env,
 # no Claude). Only when a call waits to be logged does it kick the on-demand
 # launchd agent ai.claude.call-log; the first kick installs it from the repo
@@ -45,4 +47,8 @@ case $rc in
   3) ;;  # nothing waits
   *) log "call-log pending failed (exit $rc); the next tick tries again" ;;
 esac
+# The daily follow-up of open action items (lib/call-actions.mjs): code only, no Claude, so it runs
+# right here. It sends at most one message a day, after 9:00, and only when an item is due one.
+"$TIMEOUT" --kill-after=10s 60s "$JORI_NODE" "$BIN/call-log" followup --quiet >> "$LOG" 2>&1 \
+  || log "call-log followup failed (exit $?); the next tick tries again"
 exit 0

@@ -10,7 +10,8 @@ club. Synthetic coordinates: metres north/east of a fake base point.
 
 Run: python3 tests/location-segment-confirmed-rest.test.py
 """
-import os, sys, unittest
+import io, json, os, sys, unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -105,6 +106,76 @@ class ConfirmedStopAmbiguity(unittest.TestCase):
     def test_a_place_outside_the_ring_does_not_make_it_ambiguous(self):
         hit = mod.match_confirmed_stop(CLUB_LAT, CLUB_LON, [CLUB, NEIGHBOUR])
         self.assertEqual(hit[0]["name"], "Example Jazz Club")
+
+
+# -- One Nominatim answer gives a point's neighborhood AND every area level it holds.
+# REGRESSION GUARD for a walk inside one district read as a walk to it: the start
+# answered with its small neighbourhood, the far end of the same short walk (no
+# neighbourhood field) with the wider suburb that CONTAINS it, and the two strings
+# differed. `areas` hands every level to the caller (lib/day-excursions.js
+# titleFor); `neighborhood` keeps its old value.
+
+
+class PureHelper(unittest.TestCase):
+    def test_start_point_holds_the_small_neighbourhood_and_the_wider_levels(self):
+        nbhd, areas = mod.neighborhood_and_areas(
+            {"neighbourhood": "Old Quarter", "suburb": "Harbour District", "city": "Metro City"})
+        self.assertEqual(nbhd, "Old Quarter")
+        self.assertEqual(areas, ["Old Quarter", "Harbour District", "Metro City"])
+
+    def test_far_end_holds_only_the_wider_level(self):
+        nbhd, areas = mod.neighborhood_and_areas({"suburb": "Harbour District", "city": "Metro City"})
+        self.assertEqual(nbhd, "Harbour District")
+        self.assertEqual(areas, ["Harbour District", "Metro City"])
+
+    def test_neighborhood_keeps_the_old_chain_and_borough_is_only_an_area(self):
+        # borough was never part of the neighborhood chain; it is an area level.
+        nbhd, areas = mod.neighborhood_and_areas({"borough": "Borough Example", "city": "Metro City"})
+        self.assertEqual(nbhd, "Metro City")
+        self.assertEqual(areas, ["Borough Example", "Metro City"])
+        nbhd, _ = mod.neighborhood_and_areas(
+            {"quarter": "Q", "city_district": "CD", "suburb": "S", "city": "C", "town": "T", "village": "V"})
+        self.assertEqual(nbhd, "Q")
+
+    def test_deduped_case_insensitively_and_empty_dropped_fine_to_coarse(self):
+        _, areas = mod.neighborhood_and_areas(
+            {"neighbourhood": "Metro City", "suburb": "", "city": "metro city", "town": None,
+             "village": "   ", "road": "Example Street", "square": "Example Square"})
+        self.assertEqual(areas, ["Metro City"])
+
+    def test_nothing_to_find(self):
+        self.assertEqual(mod.neighborhood_and_areas({}), (None, []))
+        self.assertEqual(mod.neighborhood_and_areas(None), (None, []))
+
+
+class OneRequest(unittest.TestCase):
+    def _urlopen(self, payload, calls):
+        def fake(req, timeout=None):
+            calls.append(req.full_url)
+            return io.BytesIO(json.dumps(payload).encode())
+        return fake
+
+    def test_both_fields_come_from_a_single_request(self):
+        calls = []
+        payload = {"address": {"neighbourhood": "Old Quarter", "suburb": "Harbour District", "city": "Metro City"}}
+        with mock.patch.object(mod.urllib.request, "urlopen", self._urlopen(payload, calls)):
+            self.assertEqual(mod.nominatim_neighborhood_areas(1.0, 2.0),
+                             ("Old Quarter", ["Old Quarter", "Harbour District", "Metro City"]))
+        self.assertEqual(len(calls), 1)
+
+    def test_the_old_entry_point_is_unchanged(self):
+        calls = []
+        payload = {"address": {"suburb": "Harbour District", "city": "Metro City"}}
+        with mock.patch.object(mod.urllib.request, "urlopen", self._urlopen(payload, calls)):
+            self.assertEqual(mod.nominatim_neighborhood(1.0, 2.0), "Harbour District")
+        self.assertEqual(len(calls), 1)
+
+    def test_a_failure_is_none_and_empty(self):
+        def boom(req, timeout=None):
+            raise OSError("no network")
+        with mock.patch.object(mod.urllib.request, "urlopen", boom):
+            self.assertEqual(mod.nominatim_neighborhood_areas(1.0, 2.0), (None, []))
+            self.assertIsNone(mod.nominatim_neighborhood(1.0, 2.0))
 
 
 if __name__ == "__main__":

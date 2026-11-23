@@ -1,0 +1,5 @@
+{
+  "_comment": "Where a new installation finds the shared Jori phone app. push_relay_url: the shared push relay (push-relay/, docs/push-relay.md); setup registers a new host with it when the host has no Apple key of its own. testflight_url: the app's public TestFlight link, shown on the setup page's phone step. JORI_PUSH_RELAY_URL and JORI_TESTFLIGHT_URL override them.",
+  "push_relay_url": "https://push.getjori.ai",
+  "testflight_url": "https://testflight.apple.com/join/NgU6pRDx"
+}

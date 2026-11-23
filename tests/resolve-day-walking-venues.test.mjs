@@ -342,3 +342,184 @@ test("two visits to one place are NOT merged across a stop somewhere else (2026-
   assert.deepEqual(out.map(s => s.id), ["a1", "mb", "pt", "a2"]);
   assert.equal(out[0].end_ts_ms, at(8, 13));
 });
+
+// ---------------------------------------------------------------------------
+// vehicleBracketed: a real stop between two city drives was called traffic.
+//
+// Two measured defects on one real day, both of which read a stop as movement
+// and sent its photos to the stop before it:
+//   (a) the drive in was ONE city-street leg, 1647 m in 4 min 18 s = 23.0 km/h,
+//       under the 25 km/h vehicle line, so "arrived by vehicle" was false;
+//   (b) the drive away began ~33 s before the window's end, and legsIn() hands
+//       back every leg that merely OVERLAPS the window, so that departure was
+//       counted as the user driving inside the window ("gridlock") before the
+//       bracket was even looked at.
+// ---------------------------------------------------------------------------
+const msS = (hms) => Date.parse(`2026-08-15T${hms}-04:00`);
+const legS = (t0, t1, a, b, m) => ({ t0: msS(t0), t1: msS(t1), lat0: a[0], lon0: a[1], lat1: b[0], lon1: b[1], m });
+const W0 = "11:03:11", W1 = "11:22:00";             // the ~19-minute window
+const bracketStop = () => ({
+  id: "s-bracket", start: "11:03", end: "11:22", start_ts_ms: msS(W0), end_ts_ms: msS(W1),
+  duration_min: 19, ...LL(0.0, 0.0), pattern: "browse",
+  place: { name: "Cafe Example", source: "osm_overpass", confidence: 0.6 },
+  photos: [], companions: [],
+});
+// On foot inside the window: 256 m at 5.1 km/h, then 390 m at 2.3 km/h.
+const footB = () => legS("11:03:30", "11:06:31", PT(0, 0), PT(150, 180), 256);
+const footC = (end = "11:21:10", m = 390) => legS("11:11:00", end, PT(150, 180), PT(260, 420), m);
+// The real day's drive in: a 2 s artifact leg, then 1647 m in 258 s = 23.0 km/h.
+const slowCityDriveIn = () => [
+  legS("10:58:28", "10:58:30", PT(-1700, -800), PT(-1500, -800), 199),
+  legS("10:58:30", "11:02:48", PT(-1500, -800), PT(0, 0), 1647),
+];
+const fastDriveIn = () => [legS("10:58:00", "11:02:00", PT(-2000, -1000), PT(0, 0), 2667)];   // 40 km/h
+const pathOf = (...legs) => ({ segments: [{ legs: legs.flat() }] });
+const runBracket = (dayPath) => {
+  const s = bracketStop();
+  const out = markMovementByPace([s], dayPath);
+  return { s, out };
+};
+const assertSpared = ({ s, out }) => {
+  assert.notEqual(s.is_movement, true, "a real stop between two drives must stay a stop");
+  assert.match(s.movement_spared_reason, /arrived by vehicle and left by vehicle/);
+  assert.equal(out.kept.length, 1);
+  assert.equal(out.demoted.length, 0);
+};
+const assertDemoted = ({ s, out }) => {
+  assert.equal(s.is_movement, true);
+  assert.equal(s.movement_spared_reason, undefined);
+  assert.equal(out.demoted.length, 1);
+};
+
+test("a stop between a 23 km/h city drive in and a drive away that starts ~33 s before the window ends is kept", () => {
+  // The real day: one slow street leg in, on-foot legs inside, then a 989 m leg at
+  // 29.4 km/h from 11:21:27 (33 s before the end) and a 752 m leg at 25.5 km/h.
+  const dayPath = pathOf(
+    slowCityDriveIn(), footB(), footC(),
+    legS("11:21:27", "11:23:28", PT(260, 420), PT(880, 1160), 989),
+    legS("11:23:28", "11:25:14", PT(880, 1160), PT(1300, 1760), 752),
+  );
+  const r = runBracket(dayPath);
+  assertSpared(r);
+  assert.ok(r.s.pace_kmh >= 1.8, "it really did clear the walking-pace test");
+  assert.equal(_internal.vehicleBracketed(dayPath, msS(W0), msS(W1)), true);
+});
+
+test("only the departure rule is needed: a fast drive in, a departure leg that starts in the window's last seconds", () => {
+  // Old failure (b) alone: the 29.4 km/h departure counted as a leg INSIDE the window.
+  const dayPath = pathOf(
+    fastDriveIn(), footB(), footC(),
+    legS("11:21:27", "11:23:28", PT(260, 420), PT(880, 1160), 989),
+  );
+  assertSpared(runBracket(dayPath));
+});
+
+test("only the slow-leg rule is needed: a 23 km/h street leg in, a plain fast drive away", () => {
+  // Old failure (a) alone: 1647 m at 23.0 km/h is under the 25 km/h line.
+  const dayPath = pathOf(
+    slowCityDriveIn(), footB(), footC(),
+    legS("11:22:00", "11:26:00", PT(260, 420), PT(1700, 1700), 3000),     // 45 km/h, after the window
+  );
+  assertSpared(runBracket(dayPath));
+});
+
+test("an arrival leg that ends seconds inside the window is the arrival, not the window", () => {
+  // Mirror of (b): the drive in ends 30 s after the window's start.
+  const dayPath = pathOf(
+    legS("11:00:00", "11:03:41", PT(-2000, -1000), PT(0, 0), 2300),       // 37 km/h, 30 s of it inside
+    footB(), footC(),
+    legS("11:22:00", "11:26:00", PT(260, 420), PT(1700, 1700), 3000),
+  );
+  assertSpared(runBracket(dayPath));
+});
+
+test("a drive in that is short and slow (600 m at 20 km/h) is not a vehicle leg", () => {
+  // Under 25 km/h AND under a kilometre: a jog or a crowded pavement, not a car.
+  const dayPath = pathOf(
+    legS("11:00:00", "11:01:48", PT(-500, -300), PT(0, 0), 600),
+    footB(), footC(),
+    legS("11:22:00", "11:26:00", PT(260, 420), PT(1700, 1700), 3000),
+  );
+  const r = runBracket(dayPath);
+  assertDemoted(r);
+  assert.equal(_internal.vehicleBracketed(dayPath, msS(W0), msS(W1)), false);
+});
+
+test("a fast leg just under a kilometre (990 m at 17.8 km/h) is not a vehicle leg either", () => {
+  const dayPath = pathOf(
+    legS("10:59:00", "11:02:20", PT(-800, -500), PT(0, 0), 990),          // 990 m in 200 s = 17.8 km/h
+    footB(), footC(),
+    legS("11:22:00", "11:26:00", PT(260, 420), PT(1700, 1700), 3000),
+  );
+  assert.equal(_internal.vehicleBracketed(dayPath, msS(W0), msS(W1)), false);
+});
+
+test("a long leg below the slow line (13 km/h over 2 km) is not a vehicle leg", () => {
+  const dayPath = pathOf(
+    legS("10:53:56", "11:03:10", PT(-1500, -1300), PT(0, 0), 2000),       // 12.99 km/h
+    footB(), footC(),
+    legS("11:22:00", "11:26:00", PT(260, 420), PT(1700, 1700), 3000),
+  );
+  const r = runBracket(dayPath);
+  assertDemoted(r);
+});
+
+test("a slow vehicle leg only on one side is not a bracket", () => {
+  // Arrived by a 23 km/h street drive, but nothing vehicle-like leaves.
+  const dayPath = pathOf(
+    slowCityDriveIn(), footB(), footC(),
+    legS("11:22:00", "11:30:00", PT(260, 420), PT(700, 900), 700),        // 5.3 km/h: walking on
+  );
+  assertDemoted(runBracket(dayPath));
+});
+
+test("gridlock inside the window is still not a stop, even with a slow-vehicle arrival", () => {
+  // A 42 km/h leg WHOLLY inside the window means the user never left the car.
+  const dayPath = pathOf(
+    slowCityDriveIn(),
+    footB(),
+    legS("11:07:00", "11:09:00", PT(150, 180), PT(600, 1400), 1400),      // 42 km/h, wholly inside
+    legS("11:11:00", "11:21:10", PT(600, 1400), PT(700, 1750), 390),
+    legS("11:22:00", "11:26:00", PT(700, 1750), PT(1700, 1700), 3000),
+  );
+  const r = runBracket(dayPath);
+  assertDemoted(r);
+  assert.equal(_internal.vehicleBracketed(dayPath, msS(W0), msS(W1)), false);
+});
+
+test("a departure leg with 60% of it inside the window is the window's own driving: gridlock, not a stop", () => {
+  // 300 s leg at 45 km/h starting 180 s before the end: most of it is INSIDE.
+  const dayPath = pathOf(
+    fastDriveIn(), footB(), footC("11:18:30"),
+    legS("11:19:00", "11:24:00", PT(260, 420), PT(1700, 1700), 3750),
+  );
+  const r = runBracket(dayPath);
+  assertDemoted(r);
+  assert.equal(_internal.vehicleBracketed(dayPath, msS(W0), msS(W1)), false);
+});
+
+test("the same departure with only 40% inside the window is the departure: the stop is kept", () => {
+  // 300 s leg starting 120 s before the end.
+  const dayPath = pathOf(
+    fastDriveIn(), footB(), footC("11:19:30"),
+    legS("11:20:00", "11:25:00", PT(260, 420), PT(1700, 1700), 3750),
+  );
+  assertSpared(runBracket(dayPath));
+});
+
+test("a window whose only on-foot leg is mostly outside it is read as before, not abstained on", () => {
+  // No leg of the window's own (the one walking leg is 27% inside): the guard falls
+  // back to what overlaps, so a slow leg still lets the bracket decide...
+  const dayPath = pathOf(
+    fastDriveIn(),
+    legS("11:19:00", "11:30:00", PT(0, 0), PT(300, 500), 700),            // 3.8 km/h walk, 180 s of 660 s inside
+    legS("11:30:00", "11:35:00", PT(300, 500), PT(1700, 1700), 3750),
+  );
+  assert.equal(_internal.vehicleBracketed(dayPath, msS(W0), msS(W1)), true);
+  // ...and a fast fringe leg with nothing on foot is still driving, not a stop.
+  const drivingOnly = pathOf(
+    fastDriveIn(),
+    legS("11:20:00", "11:25:00", PT(0, 0), PT(1700, 1700), 3750),         // 45 km/h, 40% inside
+  );
+  assert.equal(_internal.vehicleBracketed(drivingOnly, msS(W0), msS(W1)), false);
+});

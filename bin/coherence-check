@@ -1,0 +1,95 @@
+#!/usr/bin/env node
+// coherence-check — before a proactive message goes out, does every reason it
+// gives for putting two things together actually follow?
+//
+// A model reads the message on its own and judges each link that ties a
+// second, separate subject to the first ("so", "before you go", "saves a trip",
+// a bare "also"). keep → sent as written; trim → sent without the stapled-on
+// part; split → sent without it, and the part is queued for the hum to offer
+// later as its own candidate. Never blocks a message whole. Design and
+// rationale: lib/coherence-check.mjs, docs/coherence-check.md.
+//
+// Called by bin/hum-ping (before ping-route) and bin/jori-send-curl (just
+// before the speak gate, for chat-bound proactive messages hum-ping did not
+// already check).
+//
+// Usage:
+//   <json> | coherence-check [check] [--dry-run]
+//       stdin  {message, intent?, lane?, ping_id?, choices?, source?}
+//       stdout one JSON line {action: keep|trim|split|skip|error, text,
+//              decision_id, reason, split_id?}
+//       `text` is what to send. Always exits 0: any failure prints
+//       {action: "keep"} with the message unchanged (fail-open).
+//       --dry-run judges but writes nothing (no log, no queue).
+//   coherence-check stats [--since 7d] [--json]
+//   coherence-check tail [-n 10]
+//   coherence-check queue [--all]     split-off parts waiting for the hum
+//
+// Off switch: touch data/.coherence-check-off.
+
+import fs from "node:fs";
+import { coherenceCheck, stats, readLog, readSplitQueue, pendingSplits } from "../lib/coherence-check.mjs";
+
+const argv = process.argv.slice(2);
+const opt = (name) => { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : null; };
+const has = (name) => argv.includes(name);
+const emit = (o) => process.stdout.write(JSON.stringify(o) + "\n");
+
+function sinceMs(spec) {
+  const n = parseInt(spec, 10);
+  if (!Number.isFinite(n)) return 0;
+  return Date.now() - n * (String(spec).endsWith("h") ? 3_600_000 : 86_400_000);
+}
+
+async function check() {
+  let input = null;
+  try { input = JSON.parse(fs.readFileSync(0, "utf8")); } catch { /* below */ }
+  if (!input || typeof input !== "object" || typeof input.message !== "string") {
+    emit({ action: "keep", text: input && typeof input.message === "string" ? input.message : "", reason: "unreadable input" });
+    return;
+  }
+  const dry = has("--dry-run");
+  try {
+    const r = await coherenceCheck(input, { log: !dry, queue: !dry });
+    const action = r.decision === "error" ? "keep" : r.decision;
+    emit({ action, text: r.text, decision_id: r.decision_id, reason: r.reason || null, ...(r.split_id ? { split_id: r.split_id } : {}), ...(r.decision === "error" ? { error: true } : {}) });
+  } catch (e) {
+    emit({ action: "keep", text: input.message, reason: `gate error: ${String(e?.message || e).slice(0, 160)}`, error: true });
+  }
+}
+
+function printStats() {
+  const s = stats({ sinceMs: sinceMs(opt("--since") || "7d") });
+  if (has("--json")) { emit(s); return; }
+  const d = s.decisions;
+  console.log(`coherence-check, last ${opt("--since") || "7d"}: ${s.total} judged`);
+  console.log(`  keep ${d.keep || 0} · trim ${d.trim || 0} · split ${d.split || 0} · skip ${d.skip || 0} · error ${d.error || 0}${s.median_ms != null ? ` · median ${Math.round(s.median_ms / 100) / 10}s` : ""}`);
+  console.log(`  split-off parts: ${s.splits.queued} queued, ${s.splits.sent_or_tried} put through a send, ${s.splits.waiting} waiting, ${s.splits.lapsed} lapsed at day end`);
+  for (const [src, m] of Object.entries(s.by_source)) console.log(`  ${src}: ${Object.entries(m).map(([k, v]) => `${k} ${v}`).join(", ")}`);
+}
+
+function tail() {
+  const n = Number(opt("-n") || 10);
+  for (const r of readLog().slice(-n)) {
+    console.log(`${r.ts} ${r.decision.padEnd(5)} ${r.intent || r.source || ""}${r.ping_id ? ` (${r.ping_id})` : ""}`);
+    if (r.reason) console.log(`    ${r.reason}`);
+    if (r.kept) console.log(`    kept: ${r.kept}`);
+    if (r.detached) console.log(`    split off: ${r.detached}${r.split_id ? ` [${r.split_id}]` : ""}`);
+  }
+}
+
+function queue() {
+  const rows = has("--all") ? readSplitQueue() : pendingSplits();
+  if (!rows.length) { console.log(has("--all") ? "split queue is empty" : "no split-off part is waiting"); return; }
+  for (const r of rows) {
+    const state = r.consumed ? `consumed ${r.consumed_at}${r.ping_id ? ` by ${r.ping_id}` : ""}` : Date.parse(r.expires_at) > Date.now() ? `waiting until ${r.expires_at}` : "lapsed";
+    console.log(`${r.id} ${state}\n    ${r.text}\n    from ${r.from?.intent || r.from?.source || "?"}${r.from?.ping_id ? ` (${r.from.ping_id})` : ""}`);
+  }
+}
+
+const cmd = argv[0] && !argv[0].startsWith("-") ? argv[0] : "check";
+if (cmd === "check") await check();
+else if (cmd === "stats") printStats();
+else if (cmd === "tail") tail();
+else if (cmd === "queue") queue();
+else { console.error("usage: coherence-check [check|stats|tail|queue]"); process.exit(2); }

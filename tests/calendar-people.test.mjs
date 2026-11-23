@@ -178,7 +178,7 @@ test("meetingLog: an almost-daily partner gets weekly counts; a rare one each me
 
 test("an event marked not held stops counting everywhere", () => {
   const before = cal.candidates({ now: NOW }).find((c) => c.wiki_id === "user_gil").meetings;
-  cal.markNotHeld("u6", "the user: it did not happen");
+  cal.markNotHeld("u6", "the user: it did not happen", { userSaid: true });
   assert.equal(cal.candidates({ now: NOW }).find((c) => c.wiki_id === "user_gil").meetings, before - 1);
   assert.throws(() => cal.markNotHeld("no-such-event"));
 });
@@ -233,4 +233,24 @@ test("absent and present adjust who an event counts for, not whether it happened
   assert.equal(count("user_gil"), gil - 1);
   assert.equal(count("user_dana_levi"), dana);
   assert.equal(count("user_kim"), kim + 1);
+});
+
+test("a meeting with a call link is never offered for checking and cannot be ruled out by where the user was", () => {
+  // A hybrid meeting: a street address in the location field AND a Teams link.
+  cal.ingestWindow([ev("h1", "2026-11-17", { summary: "School advisory meeting", location: "Example School, 100 Main St, Springfield",
+    conferenceData: { conferenceSolution: { name: "Microsoft Teams" }, entryPoints: [{ entryPointType: "video", uri: "https://teams.microsoft.com/l/meetup-join/x" }] },
+    attendees: [me(), guest("gil@example.org", "Gil")], start: { dateTime: "2026-11-17T15:00:00-05:00" }, end: { dateTime: "2026-11-17T17:00:00-05:00" } })],
+    { fromMs: Date.parse("2026-11-16"), toMs: Date.parse("2026-11-18"), now: NOW, self });
+  assert.ok(!cal.verifyPending({ now: NOW, dayExists: () => true, verifyFrom: null }).some((r) => r.event_id === "h1"), "not offered");
+  assert.throws(() => cal.markNotHeld("h1", "day record: home all day", { verifyFrom: null }), /can be attended from anywhere/);
+  assert.doesNotThrow(() => cal.markNotHeld("h1", "the user: it did not happen", { verifyFrom: null, userSaid: true }));
+});
+
+test("a meeting with no place cannot be ruled out by the user being home, only by positive evidence", () => {
+  cal.ingestWindow([ev("n1", "2026-09-10", { summary: "Dinner with Sam and Alex", attendees: [me(), guest("gil@example.org", "Gil")], start: { dateTime: "2026-09-10T19:00:00-04:00" }, end: { dateTime: "2026-09-10T20:00:00-04:00" } })],
+    { fromMs: Date.parse("2026-09-09"), toMs: Date.parse("2026-09-11"), now: NOW, self });
+  const row = cal.verifyPending({ now: NOW, dayExists: () => true, verifyFrom: null }).find((r) => r.event_id === "n1");
+  assert.equal(row.place_known, false);
+  assert.throws(() => cal.markNotHeld("n1", "home all day", { verifyFrom: null }), /being home is not evidence/);
+  assert.doesNotThrow(() => cal.markNotHeld("n1", "the record shows the user at the theatre 18:30-21:00", { verifyFrom: null, evidence: "stop at the theatre 18:30-21:00" }));
 });

@@ -87,6 +87,14 @@ test("a caption that would read 0.0 miles walked says nothing about walking (202
   assert.match(html, /\d+ stops/);
 });
 
+test("a one-stop day's caption says 1 stop, not 1 stops", () => {
+  const r = JSON.parse(JSON.stringify(resolved));
+  r.stops = [r.stops[0]];
+  const html = buildSkeleton(r);
+  assert.match(html, /1 stop(?!s)/);
+  assert.doesNotMatch(html, /1 stops/);
+});
+
 test("a walking leg just inside the next stop's window is still that gap's walk (2026-10-24)", () => {
   // Oct 24, Old Port: the flat's stop began 5 s before the last leg of the walk back
   // from the café, and the walk home from the lunch began as the flat's stop did.
