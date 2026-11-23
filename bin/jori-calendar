@@ -230,6 +230,9 @@ const addAttendeeRaw = flag("--add-attendee") || "";
 const authorization = flag("--attendee-authorized") || "";
 const sendUpdates = flag("--send-updates");
 const dryRun = flag("--dry-run", false);
+// Leave a Zoom link as text only (no video-conference field). Rarely right; see
+// the Zoom section at the bottom of this file.
+const noZoomConference = flag("--no-zoom-conference", false);
 const overlapOk = flag("--overlap-ok") || "";
 const fromConfirmation = flag("--from-confirmation") || "";
 const joriEventClaim = flag("--jori-event") || "";
@@ -704,5 +707,52 @@ try {
   if (attendees.length) process.exit(5);
 }
 
-const res = spawnSync(GOG, gogArgs, { stdio: "inherit" });
-process.exit(res.status ?? 1);
+// ── Zoom: set the event's video conference, not just a link ──────────────
+// The owner (2026-11-23): "when scheduling a zoom meeting using google calendar
+// … the video conferencing field should be set to zoom (automatically connects
+// my link)." A create/update whose location or description carries a Zoom join
+// link gets that link attached as the event's conferenceData ("Zoom Meeting",
+// the same as picking the Zoom add-on in Calendar), so Calendar shows a Join
+// button. gog cannot set it, so lib/calendar-zoom.mjs PATCHes it right after
+// gog's write. An event that already has a video conference is left alone.
+const zoomLink = (cmd === "create" || cmd === "update") && !dryRun && !noZoomConference
+  && process.env.JORI_CALENDAR_ZOOM !== "off"
+  ? (await import("../lib/calendar-zoom.mjs")).findZoomLink(peekFlag("--location"), peekFlag("--description"))
+  : null;
+
+if (!zoomLink) {
+  const res = spawnSync(GOG, gogArgs, { stdio: "inherit" });
+  process.exit(res.status ?? 1);
+}
+
+const zoom = await import("../lib/calendar-zoom.mjs");
+// Capture stdout to learn a new event's id, then pass it through unchanged.
+const res = spawnSync(GOG, gogArgs, { stdio: ["inherit", "pipe", "inherit"], encoding: "utf8" });
+if (res.stdout) process.stdout.write(res.stdout);
+if (res.status !== 0) process.exit(res.status ?? 1);
+let zoomEventId = eventId || zoom.parseCreatedId(res.stdout);
+if (!zoomEventId) {
+  // Text output we could not read: find the event we just wrote by its window and title.
+  const from = peekFlag("--from"), to = peekFlag("--to"), summary = peekFlag("--summary");
+  if (from && to) {
+    const probe = spawnSync(GOG, ["calendar", "events", calendar, `--from=${from}`, `--to=${to}`, ...ACCOUNT_ARGS, "--no-input", "-j"], { encoding: "utf8" });
+    try {
+      const items = JSON.parse(probe.stdout || "{}").events || JSON.parse(probe.stdout || "{}").items || [];
+      const hit = items.filter((e) => e && e.summary === summary).pop();
+      if (hit) zoomEventId = hit.id;
+    } catch { /* fall through */ }
+  }
+}
+const passcode = zoom.findPasscode(peekFlag("--description"));
+const z = zoomEventId
+  ? await zoom.attachZoom({ gog: GOG, account: ACCOUNT, calendar, eventId: zoomEventId, link: zoomLink, passcode })
+  : { ok: false, reason: "could not tell which event was written" };
+// The event itself was written; a failed attach is reported, never fatal.
+if (!z.ok) console.error(`jori-calendar: event saved, but Zoom was not set as its video conference (${z.reason}). The link is still in the event.`);
+else if (!z.skipped) console.error("jori-calendar: Zoom set as the event's video conference.");
+// Its own log, not calendar-writes.jsonl: the attendee audit matches rows there by
+// event id, and a row with no guest data must never look like a covering write.
+try {
+  fs.appendFileSync(path.join(path.dirname(LOG), "calendar-zoom.jsonl"), JSON.stringify({ ts: new Date().toISOString(), action: "zoom-conference", calendar, event_id: zoomEventId || null, ok: z.ok, skipped: Boolean(z.skipped), reason: z.reason || null }) + "\n");
+} catch { /* audit row is best-effort here: no guest is involved */ }
+process.exit(0);
