@@ -121,6 +121,8 @@ This is a live conversation with the user on their phone. Response time matters.
 
 Use `gog contacts search <query>` (CLI) or `contacts_search({query})` (MCP via `tools-mcp`). Never guess, never scrape email headers, never hand-roll People API calls. If the contact isn't there, tell the user and ask them to add it — don't store elsewhere. (`bin/email-people` is a ledger of **who the user emails with, about what and when** — feeding person pages, `email-people person <email>` — not a contact source; never take a phone or address from it. `bin/chat-people` is the same kind of ledger for iMessage and WhatsApp.)
 
+**LinkedIn network:** for "do I know anyone at X?", "who is <name>?" or finding an intro, use `linkedin_connection_find({query, company})` (CLI `bin/linkedin-connections find|company`): the user's 1st-degree LinkedIn connections from their last data export, each with a `tie` from their LinkedIn messages, recommendations and endorsements. Report the tie honestly: "connection only" means connected, not known. It is not a contact source for phone numbers; roles may be stale.
+
 ## Hum Inbound Handling — chat-agent only, and it lives in chat-agent's own file
 
 Routing hum replies/reactions on the phone channel is **chat-agent's alone**; the procedure is in `agent/chat-agent/CLAUDE.md` § Hum Inbound Handling (edge cases: `agent/ops-agent/jobs/hum-operations.md`). Ops tiers never execute it: an ops job that writes a hum state file (`hum-pending-question.json`, `hum-pending-approval.json`) writes it and stops.
