@@ -92,6 +92,32 @@ test("the runner counts any recorded change as triage, and nothing as a fallback
   assert.equal(judge({ text: "", actions: [{ tool: "gmail_message" }] }).ok, false);
 });
 
+test("a run's usage becomes token counts, and no usage stays null", async () => {
+  const { usageTokens } = await import("../bin/email-triage-run");
+  assert.deepEqual(
+    usageTokens({ input_tokens: 9, output_tokens: 700, cache_read_input_tokens: 120000, cache_creation_input_tokens: 31000, cache_creation: { ephemeral_5m_input_tokens: 1000, ephemeral_1h_input_tokens: 30000 } }),
+    { input: 9, output: 700, cache_read: 120000, cache_write: 31000, cache_write_1h: 30000 });
+  assert.deepEqual(usageTokens({ total_cost_usd: 0.17 }), { input: null, output: null, cache_read: null, cache_write: null, cache_write_1h: null });
+  assert.equal(usageTokens(null), null);
+});
+
+test("the ledger row carries the four token counters the cost report prices by, and stays dollars-only without counters", async () => {
+  const { ledgerRow } = await import("../bin/email-triage-run");
+  const usage = { input_tokens: 9, output_tokens: 700, cache_read_input_tokens: 120000, cache_creation_input_tokens: 31000 };
+  const live = ledgerRow({ messageId: "msg123456789", dry: false, mode: "live", ms: 16000, cost: 0.17, usage, ok: true, ts: "2026-01-01T00:00:00.000Z" });
+  assert.equal(live.source, "gmail:msg123456789");
+  assert.equal(live.total_cost_usd, 0.17);
+  assert.deepEqual([live.input_tokens, live.output_tokens, live.cache_read_tokens, live.cache_creation_tokens], [9, 700, 120000, 31000]);
+  assert.equal(live.runner, "email-triage-oneshot");
+  const dry = ledgerRow({ messageId: "msg123456789", dry: true, mode: "shadow", ms: 1, cost: null, usage: null, ok: false });
+  assert.equal(dry.source, "email-triage-shadow:msg123456789");
+  assert.equal(dry.total_cost_usd, 0);
+  assert.equal(dry.terminal_reason, "fallback");
+  assert.ok(!("input_tokens" in dry));
+  const costOnly = ledgerRow({ messageId: "msg123456789", dry: false, mode: "live", ms: 1, cost: 0.17, usage: { total_cost_usd: 0.17 }, ok: true });
+  assert.ok(!("input_tokens" in costOnly));
+});
+
 test("a failed call is recorded as failed, never as done, and an escalation lists only what succeeded", async () => {
   const runs = [], records = [];
   const tools = makeTools({ bound, run: async (bin, args) => { runs.push([bin, ...args]); if (args[0] === "star") throw new Error("gmail 500"); return "ok"; }, record: (e) => records.push(e) });

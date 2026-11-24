@@ -52,6 +52,40 @@ export function intakeP1(content) {
   return line.toLowerCase().includes("p1");
 }
 
+/**
+ * A run's token counts from the `claude -p --output-format json` usage object.
+ * `cache_write_1h` is the part of the cache write kept for an hour (the rest
+ * lives five minutes), which says whether a later run can find the prefix still
+ * cached. Null when the envelope carried no usage.
+ */
+export function usageTokens(usage) {
+  if (!usage || typeof usage !== "object") return null;
+  const n = (v) => (Number.isFinite(v) ? v : null);
+  return {
+    input: n(usage.input_tokens), output: n(usage.output_tokens),
+    cache_read: n(usage.cache_read_input_tokens), cache_write: n(usage.cache_creation_input_tokens),
+    cache_write_1h: n(usage.cache_creation?.ephemeral_1h_input_tokens),
+  };
+}
+
+/**
+ * The run's row in the fork cost ledger: its dollars and, when the run reported
+ * them, the four token counters every other ledger row carries. The cost report
+ * prices a row by its tokens, so a row with dollars only weighs nothing there
+ * (and drops out of the headline, the per-job table and the tier split).
+ */
+export function ledgerRow({ messageId, dry, mode, ms, cost, usage, ok, ts = new Date().toISOString() }) {
+  const t = usageTokens(usage);
+  const counted = t && [t.input, t.output, t.cache_read, t.cache_write].some((v) => v !== null);
+  return {
+    ts, dispatch_id: null, short_id: String(messageId).slice(0, 6),
+    source: dry ? `email-triage-${mode}:${messageId}` : `gmail:${messageId}`, duration_ms: ms,
+    total_cost_usd: cost ?? 0,
+    ...(counted ? { input_tokens: t.input || 0, output_tokens: t.output || 0, cache_read_tokens: t.cache_read || 0, cache_creation_tokens: t.cache_write || 0 } : {}),
+    models: [MODELS.sonnet], terminal_reason: ok ? "completed" : "fallback", runner: "email-triage-oneshot",
+  };
+}
+
 const append = (f, row) => { try { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.appendFileSync(f, JSON.stringify(row) + "\n"); } catch {} };
 
 export function systemPrompt() {
@@ -155,15 +189,11 @@ async function main() {
   };
   append(LOG, {
     ts: new Date().toISOString(), messageId: p.messageId, mode: MODE, outcome: verdict.ok ? (st.escalated ? "escalated" : "triaged") : "fallback",
-    why: verdict.why || null, actions: st.actions.map((a) => a.tool), calls: st.calls.length, core_complete: st.coreComplete, ms, cost_usd: cost, dry: DRY,
+    why: verdict.why || null, actions: st.actions.map((a) => a.tool), calls: st.calls.length, core_complete: st.coreComplete, ms, cost_usd: cost, tokens: usageTokens(usage), dry: DRY,
     // what a dry run would have done, in code's words, for bin/email-triage-report
     ...(DRY ? { summaries: st.actions.map((a) => a.summary || a.tool), intake_p1: intakeP1(p.content) } : {}),
   });
-  append(COSTS, {
-    ts: new Date().toISOString(), dispatch_id: null, short_id: String(p.messageId).slice(0, 6),
-    source: DRY ? `email-triage-${MODE}:${p.messageId}` : `gmail:${p.messageId}`, duration_ms: ms,
-    total_cost_usd: cost ?? 0, models: [MODELS.sonnet], terminal_reason: verdict.ok ? "completed" : "fallback", runner: "email-triage-oneshot",
-  });
+  append(COSTS, ledgerRow({ messageId: p.messageId, dry: DRY, mode: MODE, ms, cost, usage, ok: verdict.ok }));
   console.log(JSON.stringify(out));
   process.exit(verdict.ok ? 0 : 3);
 }
