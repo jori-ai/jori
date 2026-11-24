@@ -86,6 +86,10 @@ For each pair, strongest first, read both pages and decide:
 
 Never invent a relation to justify a link. Record each pair you acted on, and each you declined, in `state.cooccurrence` (`{a, b, action: "linked"|"related"|"declined"}`), so next week does not redo them.
 
+## Step 5.6 — LinkedIn connections for person pages
+
+Run `bin/linkedin-connections link` (skip the step when `linkedin-connections stats` shows 0 connections). It links pages that carry a LinkedIn URL, asks the model about name matches, and refreshes every linked page's `## LinkedIn` block. Then `linkedin-connections link --pending` lists what is still undecided: for each page, read it and its candidates (company, title, tie) and settle it with `linkedin-connections link --decide <page_id> <slug>` when one is clearly this person, or `<page_id> none` when none is. Same name is not same person: a relative or friend in the wiki and a stranger on LinkedIn often share a name. When a page gives you nothing to judge by, decide `none` rather than guess. Never create a page for a connection. Record the count in `state.linkedin` (`{linked, none, pending}`).
+
 ## Step 6 — Questions (≤3 a run)
 
 Anything you couldn't settle (whose surname, which Guy, whether two pages are the same person) becomes a hum question. Use the format in `jobs/people-email.md` Step 5 with `"source":"wiki-link-weave"`. Before asking, read `data/hum-ideas.jsonl` so you don't repeat a question already waiting there.

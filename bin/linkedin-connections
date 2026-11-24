@@ -8,6 +8,10 @@
 //   linkedin-connections company "<company>" [--limit N] [--json]
 //   linkedin-connections get <profile-url-or-slug> [--json]
 //   linkedin-connections stats [--json]
+//   linkedin-connections link [--no-model] [--dry-run]   tie connections to wiki person pages (both ways)
+//   linkedin-connections link --pending [--json]          name matches still waiting for a same-person decision
+//   linkedin-connections link --decide <page_id> <slug|none>
+//   linkedin-connections link --show <page_id>
 //
 // "tie" says how well the owner actually knows someone, from LinkedIn messages,
 // recommendations and endorsements: strong | some | weak | connection only.
@@ -34,11 +38,14 @@ function out(rows, empty) {
   console.log(rows.map(li.format).join("\n\n"));
 }
 
+let asyncRun = false;
 try {
   switch (cmd) {
     case "import": {
       if (!pos[0]) throw new Error("usage: linkedin-connections import <export-folder>");
       const s = li.importExport(pos[0]);
+      // Decisions about who has a wiki page survive the re-import: re-stamp rows and refresh page blocks.
+      try { s.pages = require("../lib/linkedin-people").apply(); } catch (e) { s.pages = { error: e.message }; }
       console.log(json ? JSON.stringify(s) : `imported ${s.connections} connections (matched ${s.messages} messages, ${s.recommendations} recommendations, ${s.endorsements} endorsements) → ${li.DB_PATH}`);
       break;
     }
@@ -59,18 +66,56 @@ try {
       out(r ? [r] : [], `No LinkedIn connection with profile ${pos[0]}.`);
       break;
     }
+    case "link": {
+      const lp = require("../lib/linkedin-people");
+      if (args.includes("--decide")) {
+        const i = args.indexOf("--decide");
+        const [pageId, slug] = [args[i + 1], args[i + 2]];
+        if (!pageId || !slug) throw new Error("usage: link --decide <page_id> <slug|none>");
+        lp.decide(pageId, slug, { method: "manual" });
+        const r = lp.apply();
+        console.log(`${pageId} → ${slug === "none" ? "no LinkedIn connection" : slug}; pages written ${r.pages_written}`);
+        break;
+      }
+      if (args.includes("--show")) {
+        const id = flag("show");
+        console.log(JSON.stringify(lp.linkedFor(id), null, 2));
+        break;
+      }
+      const sc = lp.scan();
+      if (args.includes("--pending")) {
+        if (json) { console.log(JSON.stringify(sc.pending, null, 2)); break; }
+        if (!sc.pending.length) { console.log("Nothing pending."); break; }
+        for (const p of sc.pending) {
+          console.log(`${p.page_id} (${p.title})`);
+          for (const c of p.candidates) console.log(`  ${c.slug}: ${c.name} — ${[c.position, c.company].filter(Boolean).join(" @ ")} · connected ${c.connected_on} · tie ${c.tie}`);
+        }
+        break;
+      }
+      const dryRun = args.includes("--dry-run");
+      (async () => {
+        let auto = null;
+        if (!dryRun && !args.includes("--no-model") && sc.pending.length) auto = await lp.autoDecide(sc.pending);
+        const r = lp.apply({ dryRun });
+        const out = { url_linked: sc.url_linked, pending_before_model: sc.pending.length, model: auto, ...r };
+        console.log(json ? JSON.stringify(out, null, 2) : `linked by URL ${sc.url_linked}; name matches ${sc.pending.length}${auto ? ` (model: ${auto.linked} same person, ${auto.none} not, ${auto.left} left pending${auto.errors.length ? `; first error: ${auto.errors[0]}` : ""})` : ""}\npages linked ${r.linked}: ${r.pages_written} written, ${r.pages_unchanged} unchanged, ${r.unlinked_pages} unlinked${r.missing.length ? `; missing ${r.missing.join(", ")}` : ""}${dryRun ? " (dry run)" : ""}`);
+        li.close();
+      })().catch((e) => { console.error(`linkedin-connections: ${e.message}`); process.exit(1); });
+      asyncRun = true;
+      break;
+    }
     case "stats": {
       const s = li.stats();
       console.log(json ? JSON.stringify(s, null, 2) : `${s.connections} connections, imported ${s.imported_at || "never"} from ${s.source || "-"}\nmatched: ${JSON.stringify(s.matched)}\ntop companies: ${s.top_companies.map((c) => `${c.company} (${c.n})`).join(", ")}`);
       break;
     }
     default:
-      console.log(require("node:fs").readFileSync(__filename, "utf8").split("\n").slice(1, 16).map((l) => l.replace(/^\/\/ ?/, "")).join("\n"));
+      console.log(require("node:fs").readFileSync(__filename, "utf8").split("\n").slice(1, 20).map((l) => l.replace(/^\/\/ ?/, "")).join("\n"));
       process.exit(cmd ? 1 : 0);
   }
 } catch (e) {
   console.error(`linkedin-connections: ${e.message}`);
   process.exit(1);
 } finally {
-  li.close();
+  if (!asyncRun) li.close();
 }
