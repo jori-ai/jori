@@ -1,0 +1,76 @@
+#!/usr/bin/env node
+// linkedin-connections — look up the owner's LinkedIn connections (local DB,
+// built from a LinkedIn data export). Read-only apart from `import`.
+//
+// Usage:
+//   linkedin-connections import <export-folder>     (Connections.csv + optional messages/recs/endorsements)
+//   linkedin-connections find "<name or words>" [--company X] [--limit N] [--json]
+//   linkedin-connections company "<company>" [--limit N] [--json]
+//   linkedin-connections get <profile-url-or-slug> [--json]
+//   linkedin-connections stats [--json]
+//
+// "tie" says how well the owner actually knows someone, from LinkedIn messages,
+// recommendations and endorsements: strong | some | weak | connection only.
+// For live profile data (current role today) use bin/linkedin-lookup instead.
+
+"use strict";
+
+// node:sqlite prints an ExperimentalWarning on load; keep CLI output clean.
+const _emit = process.emitWarning;
+process.emitWarning = (w, ...a) => (String(w?.name || a[0] || "").includes("ExperimentalWarning") || /SQLite/.test(String(w)) ? undefined : _emit.call(process, w, ...a)); // lang-regex-ok: node warning text
+
+const li = require("../lib/linkedin-connections");
+
+const args = process.argv.slice(2);
+const cmd = args[0];
+const flag = (n) => { const i = args.indexOf(`--${n}`); return i === -1 ? undefined : (args[i + 1] && !args[i + 1].startsWith("--") ? args[i + 1] : true); };
+const pos = args.slice(1).filter((a, i, all) => !a.startsWith("--") && !(i > 0 && all[i - 1].startsWith("--") && all[i - 1] !== "--json"));
+const json = args.includes("--json");
+const limit = Number(flag("limit")) || 20;
+
+function out(rows, empty) {
+  if (json) return console.log(JSON.stringify(rows, null, 2));
+  if (!rows.length) return console.log(empty);
+  console.log(rows.map(li.format).join("\n\n"));
+}
+
+try {
+  switch (cmd) {
+    case "import": {
+      if (!pos[0]) throw new Error("usage: linkedin-connections import <export-folder>");
+      const s = li.importExport(pos[0]);
+      console.log(json ? JSON.stringify(s) : `imported ${s.connections} connections (matched ${s.messages} messages, ${s.recommendations} recommendations, ${s.endorsements} endorsements) → ${li.DB_PATH}`);
+      break;
+    }
+    case "find": {
+      const q = pos.join(" ");
+      const company = flag("company");
+      if (!q && !company) throw new Error("usage: linkedin-connections find \"<name>\" [--company X]");
+      out(li.find(q, { company: typeof company === "string" ? company : undefined, limit }), `No LinkedIn connection matches "${q || company}".`);
+      break;
+    }
+    case "company": {
+      if (!pos[0]) throw new Error("usage: linkedin-connections company \"<company>\"");
+      out(li.find("", { company: pos.join(" "), limit }), `No LinkedIn connection at "${pos.join(" ")}".`);
+      break;
+    }
+    case "get": {
+      const r = li.get(pos[0]);
+      out(r ? [r] : [], `No LinkedIn connection with profile ${pos[0]}.`);
+      break;
+    }
+    case "stats": {
+      const s = li.stats();
+      console.log(json ? JSON.stringify(s, null, 2) : `${s.connections} connections, imported ${s.imported_at || "never"} from ${s.source || "-"}\nmatched: ${JSON.stringify(s.matched)}\ntop companies: ${s.top_companies.map((c) => `${c.company} (${c.n})`).join(", ")}`);
+      break;
+    }
+    default:
+      console.log(require("node:fs").readFileSync(__filename, "utf8").split("\n").slice(1, 16).map((l) => l.replace(/^\/\/ ?/, "")).join("\n"));
+      process.exit(cmd ? 1 : 0);
+  }
+} catch (e) {
+  console.error(`linkedin-connections: ${e.message}`);
+  process.exit(1);
+} finally {
+  li.close();
+}
