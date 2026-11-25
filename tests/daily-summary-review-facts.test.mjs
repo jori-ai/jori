@@ -254,3 +254,76 @@ test("JORI_REVIEW_PHONE_MESSAGES=0 leaves the phone chats and the summaries out"
     if (old == null) delete process.env.JORI_REVIEW_PHONE_MESSAGES; else process.env.JORI_REVIEW_PHONE_MESSAGES = old;
   }
 });
+
+// 2026-11-24: a header named a partner for a 17-hour stay at home, and two of her texts
+// ("did you buy more oil?", "how is it going?") read as if she were somewhere else. Find My,
+// which put her on the stay in the first place, had her out for exactly those two stretches;
+// the reviewer was shown the header and the texts and not the readings, and held the day.
+import fs from "node:fs";
+import os from "node:os";
+test("the reviewer sees Find My's together and apart stretches for each person on record at a long stay", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "presence-"));
+  const at = (h, m = 0) => Date.parse("2026-11-07T00:00:00Z") + (h * 60 + m) * 60000;
+  const rows = [];
+  for (let t = at(9, 3); t <= at(16, 53); t += 10 * 60000) {
+    rows.push({ person: "Sam", t: new Date(t).toISOString(), verdict: t >= at(12) && t < at(13) ? "apart" : "together" });
+    rows.push({ person: "Alex", t: new Date(t).toISOString(), verdict: "together" });
+    rows.push({ person: "Quinn", t: new Date(t).toISOString(), verdict: "apart" });   // not on record: left out
+  }
+  fs.writeFileSync(path.join(dir, "readings-2026-11-07.json"), JSON.stringify(rows));
+  const old = process.env.COMPANION_PRESENCE_DIR;
+  process.env.COMPANION_PRESENCE_DIR = dir;
+  try {
+    const stop = { id: "s-a", start: "09:00", end: "17:00", start_ts_ms: at(9), end_ts_ms: at(17), duration_min: 480, tz: "UTC",
+      place: { name: "Home", source: "named_location" }, companions: ["Sam", "Alex", "Pat"] };
+    const day = { date: "2026-11-07", tz: "UTC", stops: [stop], path: { tz: "UTC", spine: [] } };
+    const manifest = { stops: [{ id: "s-a", start: "09:00", end: "17:00", title: "Home", companions: ["Sam", "Alex", "Pat"] }] };
+    const text = R.factPack({ date: "2026-11-07", manifest, day, statements: {}, corrections: [] });
+    const line = text.split("\n").find((l) => l.startsWith("- s-a: Sam"));
+    assert.ok(line, text);
+    assert.match(line, /Sam together 9:00am-11:58am, apart 11:58am-12:58pm, together 12:58pm-4:58pm/);
+    assert.match(line, /Alex together 9:00am-4:58pm/);
+    assert.doesNotMatch(line, /Pat|Quinn/);                  // a phone Find My does not follow, and someone not on record
+    assert.match(text, /FIND MY \(code;/);
+    // a short stay, or the switch off, adds nothing
+    const short = { ...stop, end_ts_ms: at(9, 20) };
+    assert.doesNotMatch(R.factPack({ date: "2026-11-07", manifest, day: { ...day, stops: [short] }, statements: {}, corrections: [] }), /FIND MY/);
+    process.env.JORI_REVIEW_FINDMY = "0";
+    assert.doesNotMatch(R.factPack({ date: "2026-11-07", manifest, day, statements: {}, corrections: [] }), /FIND MY/);
+  } finally {
+    delete process.env.JORI_REVIEW_FINDMY;
+    if (old == null) delete process.env.COMPANION_PRESENCE_DIR; else process.env.COMPANION_PRESENCE_DIR = old;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("no readings file means no Find My line", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "presence-"));
+  const old = process.env.COMPANION_PRESENCE_DIR;
+  process.env.COMPANION_PRESENCE_DIR = dir;
+  try {
+    const at = (h) => Date.parse("2026-11-07T00:00:00Z") + h * 3600000;
+    const stop = { id: "s-a", start: "09:00", end: "17:00", start_ts_ms: at(9), end_ts_ms: at(17), duration_min: 480, tz: "UTC", place: { name: "Home" }, companions: ["Sam"] };
+    const text = R.factPack({ date: "2026-11-07", manifest: { stops: [{ id: "s-a", companions: ["Sam"] }] },
+      day: { date: "2026-11-07", tz: "UTC", stops: [stop], path: { tz: "UTC", spine: [] } }, statements: {}, corrections: [] });
+    assert.doesNotMatch(text, /FIND MY/);
+  } finally {
+    if (old == null) delete process.env.COMPANION_PRESENCE_DIR; else process.env.COMPANION_PRESENCE_DIR = old;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A one-stop day's header is the legs' sum, floored when the stop prints a step-only walk line
+// (daily-summary-render oneStopWalkMeters); the facts must say the same or the reviewer calls
+// the line and the figure impossible together.
+test("a one-stop day's movement totals say the walked figure is a floor beside a step-only walk line", () => {
+  const T0 = Date.parse("2026-03-02T00:00:00Z"), at = (h, m = 0) => T0 + (h * 60 + m) * 60000;
+  const stop = { id: "home", start: "00:00", end: "23:00", start_ts_ms: at(0), end_ts_ms: at(23), duration_min: 1380, place: { name: "Home", source: "named_location" } };
+  const day = { date: "2026-03-02", tz: "UTC", stops: [stop],
+    path: { tz: "UTC", stats: { observed_km: 0.4, inferred_km: 0, matched_km: 0.4 },
+      spine: [{ type: "leg", id: "l0", mode: "walking", start_ms: at(8, 3), end_ms: at(8, 11), mins: 8, routed_m: 350, walked_m: 350, steps: 616 }] },
+    steps: { total: 3462, walks: [{ kind: "in_stop", stop_id: "home", leg_id: null, start_ms: at(7, 55), end_ms: at(8, 15), mins: 20, steps: 1420 }] } };
+  const text = R.factPack({ date: "2026-03-02", manifest: { stops: [{ id: "home", title: "Home", companions: [] }] }, day, statements: {}, corrections: [] });
+  assert.match(text, /walked 0\.2 miles/, text);
+  assert.match(text, /step-only walk lines under a stop[^\n]*the figure is a floor/, text);
+});
