@@ -14,12 +14,17 @@
 // Those are listed apart, as answered and waiting to be acted on. Rows that are
 // not ideas (no status: a resolved question that landed in the ledger) are skipped.
 //
+// An idea the hum ranker retired in the reservoir (lib/hum-ideas.mjs retiredIds:
+// the situation ended, or it was expired) is no longer asked about, so it is not
+// listed as being asked or as an answer waiting to be acted on either. Without
+// this a retired idea sat in "answered, not yet recorded" week after week.
+//
 // Usage: hum-ideas-brief [--json] [--days N]   (default 7)
 // Env (tests): HUM_IDEAS_FILE.
 
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
-import { loadLatest, routeFor } from "../lib/hum-ideas.mjs";
+import { loadLatest, routeFor, retiredIds } from "../lib/hum-ideas.mjs";
 import { readAllResponses } from "../lib/hum-responses.mjs";
 
 const ANSWER_LANE = "hum_improvement:";
@@ -37,14 +42,15 @@ export function answersById(responses) {
 
 const isIdea = (i) => i && i.consumed !== true && typeof i.status === "string";
 
-export function brief(allIdeas, now = Date.now(), days = 7, answers = new Map()) {
+export function brief(allIdeas, now = Date.now(), days = 7, answers = new Map(), retired = new Set()) {
   const ideas = (allIdeas || []).filter(isIdea);
   const since = now - days * 86400000;
   const ts = (i) => Date.parse(i.applied_at || i.reconciled_at || i.retired_at || "");
   const line = (i) => ({ id: i.id, title: i.title, risk: i.risk, effort: i.effort, scope: i.scope, proposed_at: i.proposed_at || null, change: i.proposed_change || null });
   const landed = ideas.filter((i) => i.status === "applied" && ts(i) >= since).map(line);
   const big = ideas.filter((i) => routeFor(i) === "weekly_email").map(line);
-  const asked = ideas.filter((i) => routeFor(i) === "ask_in_chat");
+  // The same rule the hum_asks harvester applies: a retired idea is not asked about.
+  const asked = ideas.filter((i) => routeFor(i) === "ask_in_chat" && !retired.has(i.id));
   const asking = asked.filter((i) => !answers.has(i.id)).map(line);
   const answered = asked.filter((i) => answers.has(i.id))
     .map((i) => ({ ...line(i), answered_at: answers.get(i.id).at, answer: answers.get(i.id).reply }));
@@ -72,6 +78,8 @@ export function text(b) {
 if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const args = process.argv.slice(2);
   const di = args.indexOf("--days");
-  const b = brief(loadLatest(), Date.now(), di >= 0 ? Number(args[di + 1]) || 7 : 7, answersById(readAllResponses()));
+  let retired = new Set();
+  try { retired = retiredIds(); } catch { /* no reservoir: nothing is retired */ }
+  const b = brief(loadLatest(), Date.now(), di >= 0 ? Number(args[di + 1]) || 7 : 7, answersById(readAllResponses()), retired);
   console.log(args.includes("--json") ? JSON.stringify(b, null, 2) : text(b));
 }
