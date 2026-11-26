@@ -1073,9 +1073,83 @@ def _clock(iso, ref):
     return t.strftime("%-I:%M %p") if t.date() == _local(ref).date() else local_time(iso)
 
 
+# Above this many device lines in one site's section, the section is grouped
+# (daily_text): a device that is still offline is always named, but devices of
+# the same type share a line, and devices that came back are one count.
+DAILY_DETAIL_MAX = 5
+
+_HEX = set("0123456789abcdefABCDEF")
+
+
+def _kind_and_id(name):
+    """Split a roster name like "Smart plug 0a:1b:2c (Den)" into its type
+    ("Smart plug"), its address fragment ("0a:1b:2c") and the rest ("(Den)"),
+    from the name's own shape: the first word made of two-character hex
+    groups joined by colons. A name with no such word has no type."""
+    words = name.split()
+    for i, w in enumerate(words):
+        bits = w.split(":")
+        if len(bits) >= 2 and all(len(b) == 2 and set(b) <= _HEX for b in bits):
+            return (" ".join(words[:i]) or None), w, " ".join(words[i + 1:])
+    return None, name, ""
+
+
+def _when(sinces, t, one, many):
+    """" since 3:10 PM" / " since between ... and ..." (or the `at`/`between`
+    pair given), from the earliest and latest time; "" when none is known."""
+    sinces = sorted(x for x in sinces if x)
+    if not sinces:
+        return ""
+    lo, hi = _clock(sinces[0], t), _clock(sinces[-1], t)
+    return f" {one} {lo}" if lo == hi else f" {many} {lo} and {hi}"
+
+
+def _grouped(rows, t):
+    """The long form of one site's section: one line per type for devices that
+    were already offline at the last summary, one per type for devices that
+    went offline since, each device still named; single devices, devices never
+    seen yet and devices first seen today keep their own line; devices that
+    were offline and are back are one count line."""
+    lines, back = [], []
+    stale, fresh = {}, {}
+    for r in rows:
+        if r["cls"] == "back":
+            back.append(r)
+        elif r["cls"] == "still":
+            kind, ident, rest = _kind_and_id(r["name"])
+            key = (kind, rest) if kind else ("\0" + r["name"], "")
+            (fresh if r["new"] else stale).setdefault(key, []).append((r, ident))
+        else:
+            lines.append(r["line"])
+    out = []
+    for groups, what, one, many in ((stale, "still offline", "since", "since between"),
+                                    (fresh, "went offline", "at", "between")):
+        for (kind, rest), members in groups.items():
+            if len(members) == 1 or kind.startswith("\0"):
+                out += [m[0]["line"] for m in members]
+                continue
+            label = f"{kind} {rest}".strip()
+            when = _when([m[0]["since"] for m in members], t, one, many)
+            ids = ", ".join(m[1] for m in members)
+            out.append(f"- {label}: {len(members)} {what}{when}: {ids}.")
+    out += lines
+    if back:
+        counts = {}
+        for r in back:
+            k = _kind_and_id(r["name"])[0] or r["name"]
+            counts[k] = counts.get(k, 0) + 1
+        kinds = ", ".join(f"{k}: {n}" for k, n in counts.items())
+        out.append(f"- {len(back)} {'was' if len(back) == 1 else 'were'} offline for a while and came back ({kinds}); "
+                   "the times are in the device outage log.")
+    return out
+
+
 def daily_text(cfg, state, t):
     """The daily summary's section: per site, what went offline, came back, or
-    is still offline since the last section. One line when all is well."""
+    is still offline since the last section. One line when all is well. Up to
+    DAILY_DETAIL_MAX device lines are listed one per device; above that the
+    section is grouped (_grouped), so a day after a Wi-Fi change does not list
+    every plug and bulb, and a device still offline is never left out."""
     labels = {k: v.get("label", k) for k, v in cfg.get("sites", {}).items()}
     devs = [d for d in cfg.get("devices", []) if d.get("tier") == "daily"]
     events = state.get("daily_events", [])
@@ -1085,6 +1159,7 @@ def daily_text(cfg, state, t):
         label = labels.get(key, key)
         mine = [d for d in devs if d["site"] == key]
         lines = []
+        rows = []
         for d in mine:
             s = state["devices"].get(d["name"], {})
             evs = [e for e in events if e["name"] == d["name"]]
@@ -1097,20 +1172,31 @@ def daily_text(cfg, state, t):
                 else:
                     spans.append([e.get("since"), e["at"], e.get("seeded")])
             parts = []
+            came_back = False
             for sp in spans:
                 down_at, up_at = sp[0], sp[1]
                 if up_at and len(sp) > 2 and sp[2]:
                     parts.append(f"missing when the watch began, first seen at {_clock(up_at, t)}")
                 elif up_at:
+                    came_back = True
                     parts.append(f"offline from {_clock(down_at, t)} to {_clock(up_at, t)}")
+            cls = "back" if came_back else "other"
             if s.get("status") == "down":
                 since = s.get("since")
                 if s.get("seeded"):
+                    cls = "other"
                     parts.append(f"not seen since the watch began ({local_time(since)})" if since else "not seen yet")
                 else:
+                    cls = "still"
                     parts.append(f"offline since {_clock(since, t)}" if since else "offline")
             if parts:
-                lines.append(f"- {d['name']}: {'; '.join(parts)}.")
+                line = f"- {d['name']}: {'; '.join(parts)}."
+                lines.append(line)
+                rows.append({"name": d["name"], "line": line, "cls": cls, "since": s.get("since"),
+                             # went offline since the last summary: its open span started in this window
+                             "new": bool(spans and spans[-1][1] is None)})
+        if len(lines) > DAILY_DETAIL_MAX:
+            lines = _grouped(rows, t)
         cl = (cfg["sites"].get(key) or {}).get("client_list")
         c = lists.get(key, {})
         unread = None
@@ -1120,7 +1206,7 @@ def daily_text(cfg, state, t):
                 why = c.get("skipped") or c.get("error") or "not read yet"
                 unread = (f"The {cl.get('label') or cl.get('via') or 'router'} device list has not been read"
                           + (f" since {local_time(read_at)}" if read_at else "") + f" ({why}), so these could not be checked.")
-        n_ok = len(mine) - len(lines)
+        n_ok = len(mine) - len(rows)
         if unread:
             blocks.append(f"{label}, daily device watch: {unread}" + ("\n" + "\n".join(lines) if lines else ""))
         elif not lines:
