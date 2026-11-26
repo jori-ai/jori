@@ -59,8 +59,19 @@
 // A REWRITE IS CHECKED before it replaces the sender's text (vetRewrite): a
 // tool-less Haiku pass, Sonnet if that answer is off schema, asks whether it
 // states anything that neither the original, the evidence nor the judge's own
-// findings show, or that the evidence contradicts. If so, or if the check
-// cannot finish, the original is sent as written: the gate's fail-open path.
+// findings show, or that the evidence contradicts. If so, the rewrite is
+// withdrawn. When the judge had found nothing wrong with the original itself
+// (the rewrite was for wording), or the check cannot finish, the original is
+// sent as written: the gate's fail-open path. So it is when the check found
+// the records contradicting the judge's own text (the judge's note is then not
+// to be trusted). Otherwise a model reads the judge's truth note
+// (trimOriginal): if it says the original states something false, sending it
+// unchanged delivers a message the gate knows is wrong, so the model deletes
+// only that part, code proves it is a pure deletion, the check reads the
+// result once more, and the trimmed text is sent. Only when the model says the
+// wrong part is the WHOLE message is a proactive message held ("digest");
+// every other failure sends the original as written, and a reply is never
+// held. A report email is never trimmed: its fix is only shown in the app.
 //
 // Claude only, never Jev: money and health messages pass through here too.
 //
@@ -68,8 +79,9 @@
 //          reply_to_text?, channel?, supporting_data?, fixed_choices? (a card's
 //          option labels), as_of? (replay)}
 // Stdout: {verdict, message?, research_plan?, reason, checks, sources, ms, evidence_ms?,
-//          rewrite_added_claim?, rewrite_claims?}; a checked rewrite carries
-//          checks.rewrite_check {added_claim, added, contradicted, tier | error, ms, withdrawn?}
+//          rewrite_added_claim?, rewrite_claims?, original_trimmed?}; a checked rewrite carries
+//          checks.rewrite_check {added_claim, added, contradicted, tier | error, ms, withdrawn?,
+//          trimmed?, removed?, trim_tier?, trim_ms?, trim_skipped?, trim_failed?}
 // Fail-open: an error emits {verdict:"send", reason:"gate_error:…"}.
 // Env: SPEAK_GATE_LOG (default data/speak-gate-log.jsonl), SPEAK_GATE_NO_LOG=1,
 //      SPEAK_GATE_TIMEOUT_S (proactive 300, reply 120), SPEAK_GATE_SENT_LOG (default
@@ -82,7 +94,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { resolvedAnswers } from "../lib/speak-gate-live.mjs";
-import { OWNER, ASSISTANT, TOOLS_DOC, IDENTITY_RULE, GOG, webAllowed as webAllowedFor, runAgent, lastJson, readLessons, checkRewrite } from "../lib/speak-gate-agent.mjs";
+import { OWNER, ASSISTANT, TOOLS_DOC, IDENTITY_RULE, GOG, webAllowed as webAllowedFor, runAgent, lastJson, readLessons, checkRewrite, trimOriginal, isPureDeletion } from "../lib/speak-gate-agent.mjs";
 import { eventPeopleLine } from "../lib/meeting-event.mjs";
 import { financeScope, financeRecords, FINANCE_EVIDENCE_TITLE, PREMISE_RULE, applyPremiseRule } from "../lib/speak-gate-finance.mjs";
 
@@ -314,7 +326,7 @@ ${IDENTITY_RULE}
 
 ${PREMISE_RULE}
 
-A REWRITE NEVER CLAIMS MORE than the original and the sources you checked show. A message that says a change was approved, applied or committed must not become "live", "running" or "working" unless a source you checked shows it running. Every fact a rewrite states that the original did not (a time, a name, a status, that something did or did not happen) must be one you found: put it in checks with where you found it. Not finding something does not show it is not there: never write that something is missing, unanswered or not on record unless a source you read says so. A separate check reads your rewrite against the original, the evidence below and your checks, and sends the original instead when the rewrite says anything none of them shows.
+A REWRITE NEVER CLAIMS MORE than the original and the sources you checked show. Repair by removing, softening, shortening or reordering what is there. A message that says a change was approved, applied or committed must not become "live", "running" or "working" unless a source you checked shows it running. Add a fact the original did not state (a time, a name, a status, that something did or did not happen) only when you found it in a source you checked, and put it in checks with where you found it. When a correction would need a fact you did not find, say less instead: cut the wrong part rather than replace it with a guess. Not finding something does not show it is not there: never write that something is missing, unanswered or not on record unless a source you read says so. A separate check reads your rewrite against the original, the evidence below and your checks; when the rewrite says anything none of them shows, the rewrite is withdrawn, and if you found the original wrong, only the wrong part is cut from it when that can be done cleanly (a proactive message whose whole point is wrong is held); otherwise the original is sent as written.
 
 RESEARCH FIRST. Use the tools to verify the claims and look for answers before you decide; check several sources, not one. Budget: a few minutes. You cannot change anything, and must not try.
 
@@ -346,21 +358,50 @@ async function judge(input, ev, extra) {
 // A rewrite replaces the sender's words, so it is read once more before it
 // goes out (checkRewrite in lib/speak-gate-agent.mjs). When it states anything
 // that neither the original, the evidence nor the judge's own findings show,
-// or that the evidence contradicts, or when the check cannot finish in time,
-// the ORIGINAL is sent as written: the path every gate failure already takes
-// (fail open), and the one text whose claims came from its sender's own
-// sources. A correction the judge found and named in its checks passes, so a
-// false claim it caught is still fixed. The live sender kills the gate at its
-// budget + 90 s (lib/speak-gate-live.mjs runGate), so the check stops 10 s
+// or that the evidence contradicts, the rewrite is withdrawn. A correction the
+// judge found and named in its checks passes, so a false claim it caught is
+// still fixed. The live sender kills the gate at its budget + 90 s
+// (lib/speak-gate-live.mjs runGate), so every model step here stops 10 s
 // before that.
+//
+// What goes out instead of a withdrawn rewrite depends on what the judge found:
+//   - the check could not run, the judge found nothing wrong with the original
+//     (checks.true "ok": the rewrite was about wording or value), the check
+//     found the records contradicting the judge's own text (its note is not to
+//     be trusted then), or the message is a report email (its fix is only shown
+//     in the app): the ORIGINAL as written, the fail-open path;
+//   - any other truth note: trimOriginal has a model read it, and when it says
+//     the original states something false, cut out only that part. A cut that
+//     isPureDeletion rejects climbs to the next rung, and the check reads an
+//     accepted cut once more (deleting a "not" flips a sentence). A clean cut
+//     goes out as the message.
+//   - holding is the one narrow case: the model says the wrong part is the
+//     whole message, on a proactive message → "digest". (The live sender still
+//     delivers intents it never holds.) Every other failure — no clean cut on
+//     any rung, a trimmed text the check flags or cannot read, a note that does
+//     not say the original is wrong, a reply — sends the original as written,
+//     with why in rewrite_check.trim_skipped / trim_failed.
+
+/** The judge's truth note on the original, or null when it is a plain ok. */
+function originalFinding(r) {
+  const t = r && r.checks && typeof r.checks === "object" && !Array.isArray(r.checks) ? r.checks.true : null;
+  if (typeof t !== "string") return null;
+  const s = t.trim();
+  // The judge's output schema is "true": "ok|<problem>"; it often explains an
+  // ok ("ok: the calendar shows it"), so a field that opens with that token is
+  // ok and nothing is trimmed. A schema check on the judge's own field. Any
+  // other note is free text that may still confirm the original, so whether it
+  // says the original is wrong is the trim model's reading, not this test's.
+  if (!s || s.slice(0, 2).toLowerCase() === "ok") return null;
+  return s.slice(0, 400);
+}
+
 async function vetRewrite(input, r, records, t0) {
   const reply = input.kind === "reply" || input.kind === "report";
   const budgetS = Number(process.env.SPEAK_GATE_TIMEOUT_S || (reply ? 120 : 300));
-  const c = await checkRewrite({
-    original: input.message, rewrite: r.message, records,
-    findings: { reason: r.reason, checks: r.checks, sources: r.sources },
-    deadline: t0 + (budgetS + 80) * 1000,
-  });
+  const deadline = t0 + (budgetS + 80) * 1000;
+  const findings = { reason: r.reason, checks: r.checks, sources: r.sources };
+  const c = await checkRewrite({ original: input.message, rewrite: r.message, records, findings, deadline });
   const base = r.checks && typeof r.checks === "object" && !Array.isArray(r.checks) ? r.checks : { judge: r.checks ?? null };
   const claims = c.ran ? [...c.added, ...c.contradicted.map((x) => `contradicted: ${x}`)] : [];
   const check = c.ran
@@ -369,13 +410,48 @@ async function vetRewrite(input, r, records, t0) {
   if (c.ran && !claims.length) return { ...r, checks: { ...base, rewrite_check: check }, rewrite_added_claim: false, rewrite_claims: [] };
   const why = !c.ran ? `the rewrite check could not run: ${c.error}`
     : [c.added.length ? `nothing shows ${c.added.join("; ")}` : "", c.contradicted.length ? `the records contradict ${c.contradicted.join("; ")}` : ""].filter(Boolean).join("; and ");
-  return {
+  const withdrawn = { ...check, withdrawn: String(r.message).slice(0, 2000) };
+  const common = { sources: r.sources, rewrite_added_claim: check.added_claim, rewrite_claims: claims };
+  const asWritten = (extra = {}) => ({
     verdict: "send",
     reason: `Rewrite withdrawn, sent as written (${why}). Gate: ${r.reason || ""}`.slice(0, 300),
-    checks: { ...base, rewrite_check: { ...check, withdrawn: String(r.message).slice(0, 2000) } },
-    sources: r.sources,
-    rewrite_added_claim: check.added_claim,
-    rewrite_claims: claims,
+    checks: { ...base, rewrite_check: { ...withdrawn, ...extra } },
+    ...common,
+  });
+
+  const finding = originalFinding(r);
+  if (!c.ran || !finding || input.kind === "report") return asWritten();
+  const notTrimmed = (extra) => ({ ...asWritten(extra), original_trimmed: false });
+  if (c.contradicted.length) return notTrimmed({ trim_skipped: "the records contradicted the judge's own text" });
+
+  const choices = Array.isArray(input.fixed_choices) && input.fixed_choices.length ? input.fixed_choices : null;
+  const t = await trimOriginal({ original: input.message, finding, reason: r.reason, choices, deadline,
+    accept: (cut) => isPureDeletion(input.message, cut) });
+  if (!t.ran) return notTrimmed({ trim_failed: `no clean trim: ${t.error}`.slice(0, 300), trim_ms: t.ms });
+  const trimInfo = { trim_tier: t.tier, trim_ms: t.ms };
+  if (!t.original_wrong) return notTrimmed({ trim_skipped: "the judge's note does not say the original is wrong", ...trimInfo });
+  if (t.trimmed === null) {
+    if (input.kind !== "proactive") return notTrimmed({ trim_failed: "the wrong part is the whole message", ...trimInfo });
+    return {
+      verdict: "digest",
+      reason: `Rewrite withdrawn; what the gate found wrong is the whole message (${finding})`.slice(0, 300),
+      checks: { ...base, rewrite_check: { ...withdrawn, trim_failed: "the wrong part is the whole message", ...trimInfo } },
+      ...common,
+      original_trimmed: false,
+    };
+  }
+  const c2 = await checkRewrite({ original: input.message, rewrite: t.trimmed, records, findings, deadline });
+  if (!c2.ran) return notTrimmed({ trim_failed: `the trimmed text could not be checked: ${c2.error}`.slice(0, 300), ...trimInfo });
+  if (c2.added.length || c2.contradicted.length) {
+    return notTrimmed({ trim_failed: `the trimmed text still says what nothing shows: ${[...c2.added, ...c2.contradicted].join("; ")}`.slice(0, 300), ...trimInfo });
+  }
+  return {
+    verdict: "rewrite",
+    message: t.trimmed,
+    reason: `Rewrite withdrawn; sent without the part the gate found wrong (${finding}).`.slice(0, 300),
+    checks: { ...base, rewrite_check: { ...withdrawn, trimmed: true, removed: t.removed, ...trimInfo } },
+    ...common,
+    original_trimmed: true,
   };
 }
 
