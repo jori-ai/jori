@@ -3,7 +3,10 @@
 // Run: node --test tests/calendar-place.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { placeEvents, calendarPlaceAt, CAL_MATCH_M } from "../lib/calendar-place.mjs";
+import { placeEvents, calendarPlaceAt, geocodeLocation, CAL_MATCH_M } from "../lib/calendar-place.mjs";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 // Synthetic coordinates: metres east/north of an obviously fake origin, so the
 // fixtures keep the real traces' geometry without pinning a real place.
@@ -93,4 +96,36 @@ test("two businesses at the address both fit → a shortlist question, no name",
   assert.equal(v.source, "calendar_ambiguous");
   assert.equal(v.name, null);
   assert.deepEqual(v.shortlist.map((c) => c.name), ["מאהר חלפים", "דפוס לדוגמה"]);
+});
+
+// A refused lookup says nothing about the address: cached as a negative, it kept the calendar from
+// placing a stop there for a week (a cinema address refused at the month's Places ceiling).
+function fakeLookup(exitCode, stdout = "") {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cal-geo-"));
+  const bin = path.join(dir, "verify.sh");
+  fs.writeFileSync(bin, `#!/bin/sh\n${stdout ? `echo '${stdout}'\n` : ""}exit ${exitCode}\n`, { mode: 0o755 });
+  return { dir, bin, cacheFile: path.join(dir, "cache.json") };
+}
+
+for (const code of [3, 4, 5, 6]) {
+  test(`a Places refusal (exit ${code}) is not cached as "no such address"`, () => {
+    const f = fakeLookup(code);
+    const out = geocodeLocation("Example Cinema, 1 Sample Blvd #3001, Sampleton", 12.3, -65.4, { cacheFile: f.cacheFile, verifyBin: f.bin });
+    assert.equal(out, null);
+    assert.equal(fs.existsSync(f.cacheFile), false, "a refusal must leave the cache untouched");
+    fs.rmSync(f.dir, { recursive: true, force: true });
+  });
+}
+
+test("a genuine no-match (exit 1) is still cached, and a match is returned and cached", () => {
+  const none = fakeLookup(1);
+  assert.equal(geocodeLocation("Nowhere Plaza", 12.3, -65.4, { cacheFile: none.cacheFile, verifyBin: none.bin }), null);
+  assert.equal(JSON.parse(fs.readFileSync(none.cacheFile, "utf8"))["Nowhere Plaza"].lat, null);
+  fs.rmSync(none.dir, { recursive: true, force: true });
+
+  const hit = fakeLookup(0, '{"lat":12.3456,"lon":-65.4321,"name":"Example Cinema","address":"1 Sample Blvd"}');
+  const g = geocodeLocation("Example Cinema, 1 Sample Blvd", 12.3, -65.4, { cacheFile: hit.cacheFile, verifyBin: hit.bin });
+  assert.equal(g.name, "Example Cinema");
+  assert.equal(JSON.parse(fs.readFileSync(hit.cacheFile, "utf8"))["Example Cinema, 1 Sample Blvd"].lat, 12.3456);
+  fs.rmSync(hit.dir, { recursive: true, force: true });
 });
