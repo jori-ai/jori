@@ -52,10 +52,16 @@
 //               the cheaper run on it, still ends under 100% (outside the
 //               final_day window), and the user is told afterwards on the
 //               system channel; the card is asked only past that.
+//               Inside the final_day window, a job whose run is estimated
+//               under final_day.small_share of the week runs on the usual
+//               model without a card, as long as the week, with the run on
+//               it, stays under final_day.small_ceiling. A job with no cost
+//               history is not small: it is still asked about.
 //
 // Config, the installation's decision: agent/local/config/allowance-brake.json
 //   { "threshold": 0.95, "usd_per_allowance": 1400,
-//     "final_day": { "hours": 24, "threshold": 0.90 },
+//     "final_day": { "hours": 24, "threshold": 0.90,
+//                    "small_share": 0.005, "small_ceiling": 0.98 },
 //     "jobs": { "<job>": { "importance": "optional|important|essential",
 //                          "release_label": "<launchd label>",
 //                          "cost_estimate": 0.02,
@@ -67,6 +73,8 @@
 // as interactive sessions, lands on top of it) and a held job waits at most
 // `hours` for the reset. Inside that stretch the lower of the two thresholds
 // applies, to `check` and `release` alike; absent, one threshold all week.
+// `small_share` and `small_ceiling` (optional, both or neither) let an
+// important job too small to matter run there without a card (see above).
 // No config file = the governor is off.
 //
 // FAIL-OPEN. No sample, a sample older than MAX_SAMPLE_AGE_H, a window younger
@@ -234,7 +242,11 @@ function reading(cfg) {
   const daysLeft = (resetMs - NOW) / 864e5;
   const span = { from: base.t, to: last.t, delta: last.u - base.u };
   if (util >= threshold) {
-    return { hold: true, reason: `the week is at ${pct(util)}, past the ${brake}; waits for the reset at ${resets_at}`, utilization: util, projected: util, pace_per_day: null, resets_at, span, threshold };
+    // Where the week would end at the day's plain pace. Only the last-day
+    // small-run check reads it: its ceiling is about where the week ends, not
+    // where it stands. Null when the span is too short to rate.
+    const paced = spanH >= MIN_RATE_SPAN_H ? +(util + Math.max(0, (last.u - base.u) / (spanH / 24)) * daysLeft).toFixed(3) : null;
+    return { hold: true, reason: `the week is at ${pct(util)}, past the ${brake}; waits for the reset at ${resets_at}`, utilization: util, projected: util, paced_projection: paced, pace_per_day: null, resets_at, span, threshold };
   }
   if (spanH < MIN_RATE_SPAN_H) return open(`only ${spanH.toFixed(1)}h of this window to rate; week at ${pct(util)}`, { utilization: util, resets_at });
   let catchUp = 0;
@@ -322,9 +334,11 @@ function config() {
     const usd = Number(c.usd_per_allowance);
     const fd = c.final_day && typeof c.final_day === "object" ? c.final_day : {};
     const fdT = Number(fd.threshold), fdH = Number(fd.hours);
+    const fdS = Number(fd.small_share), fdC = Number(fd.small_ceiling);
+    const small = fdS > 0 && fdS < 1 && fdC > 0 && fdC <= 1 ? { small_share: fdS, small_ceiling: fdC } : {};
     return {
       threshold: threshold > 0 && threshold <= 1 ? threshold : 0.95,
-      final_day: fdT > 0 && fdT <= 1 && fdH > 0 ? { threshold: fdT, hours: fdH } : null,
+      final_day: fdT > 0 && fdT <= 1 && fdH > 0 ? { threshold: fdT, hours: fdH, ...small } : null,
       usd_per_allowance: usd > 0 ? usd : DEFAULT_USD_PER_ALLOWANCE,
       jobs: c.jobs && typeof c.jobs === "object" ? c.jobs : {},
       auto_cheaper: c.auto_cheaper === true,
@@ -486,6 +500,18 @@ function check(job) {
     const note = `${entry.label || job} ran on the cheaper model (${entry.cheaper.model}) without asking: the week is at ${pct(r.utilization)} and on pace for ${pct(r.projected ?? r.utilization)}, so it still ends under 100%.`;
     notifyAfter(note);
     return runNow("cheaper", `${why}; ran on the cheaper model by your standing choice (projected under 100%)`, { model: entry.cheaper.model, effort: entry.cheaper.effort || null, auto: true });
+  }
+  // Standing choice (config final_day.small_share / small_ceiling): inside the
+  // last-day window a run too small to matter goes ahead on the usual model
+  // without a card, unless the week, with it on, would reach the ceiling. An
+  // unknown cost (no run history) is not small.
+  const fd = cfg.final_day || {};
+  const endsAt = r.paced_projection ?? r.projected ?? r.utilization;
+  const smallRun = lastDay && fd.small_share > 0 && est.share > 0 && est.share < fd.small_share
+    && endsAt + est.share < fd.small_ceiling;
+  if (smallRun) {
+    closeQuestions(st, job, "small run on the last day");
+    return runNow("run", `a small run (~${sharePct(est.share)} of the week) goes ahead on the last day without asking: the week is at ${pct(r.utilization)} and on pace for ${pct(endsAt)}, under the ${pct(fd.small_ceiling)} ceiling with it`, { small: true });
   }
   recordHeld(st, job, label, r);
   const pending = st.asks && st.asks[job];

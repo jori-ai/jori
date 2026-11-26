@@ -444,3 +444,67 @@ it("without auto_cheaper the same week still asks", () => {
   const r = run(fx, ["check", "chat-build", "--json"]);
   assert.equal(r.rc, 3, r.out);
 });
+
+// ─── Small runs on the last day (the installation's standing choice) ────────
+// Inside the final_day window an important job whose run is under
+// final_day.small_share of the week runs on the usual model without a card,
+// unless the week, with it on, would reach final_day.small_ceiling.
+const SMALL = {
+  threshold: 0.95,
+  final_day: { hours: 24, threshold: 0.90, small_share: 0.005, small_ceiling: 0.98 },
+  jobs: {
+    "tiny": { importance: "important", cost_estimate: 0.002, release_label: "ai.test.tiny" },
+    "medium": { importance: "important", cost_estimate: 0.04 },
+    "unknown": { importance: "important" },
+    "tiny-optional": { importance: "optional", cost_estimate: 0.002 },
+  },
+};
+
+it("last day: a small important run goes ahead without a card while the week stays under the ceiling", () => {
+  const fx = fixture({ points: LAST_DAY, config: SMALL });
+  const r = run(fx, ["check", "tiny", "--json"], LAST_DAY_NOW);
+  assert.equal(r.rc, 0, r.out);
+  assert.equal(r.json.decision, "run");
+  assert.equal(r.json.small, true);
+  assert.equal(r.json.threshold, 0.90);
+  const st = fs.existsSync(fx.state) ? JSON.parse(fs.readFileSync(fx.state, "utf8")) : {};
+  assert.equal((st.questions || []).length, 0, "no card");
+  assert.equal((st.held || {}).tiny, undefined, "not held");
+});
+
+it("last day: past the brake but on a slow pace, a small run still goes ahead", () => {
+  // 0.90 -> 0.91 over 22h: past the 90% last-day brake, on pace for ~92%.
+  const fx = fixture({ points: [["2026-11-03T13:00:00Z", 0.90], ["2026-11-04T11:00:00Z", 0.91]], config: SMALL });
+  const r = run(fx, ["check", "tiny", "--json"], LAST_DAY_NOW);
+  assert.equal(r.rc, 0, r.out);
+  assert.equal(r.json.small, true);
+});
+
+it("last day: a small run is asked about when the week is on track to reach the ceiling", () => {
+  // 0.88 -> 0.95 over 22h: ~7.6%/day, 16h left, so on pace for about 100%.
+  const fx = fixture({ points: [["2026-11-03T13:00:00Z", 0.88], ["2026-11-04T11:00:00Z", 0.95]], config: SMALL });
+  const r = run(fx, ["check", "tiny", "--json"], LAST_DAY_NOW);
+  assert.equal(r.rc, 3, r.out);
+  assert.match(r.json.reason, /asked you/); // lang-regex-ok: asserts the governor's own output, not the user's words
+  assert.ok(r.json.paced_projection >= 0.98, `paced ${r.json.paced_projection}`);
+});
+
+it("last day: a bigger run, one with no cost history, and an optional job are handled as before", () => {
+  const fx = fixture({ points: LAST_DAY, config: SMALL });
+  assert.match(run(fx, ["check", "medium", "--json"], LAST_DAY_NOW).json.reason, /asked you/); // lang-regex-ok: the governor's own output
+  assert.match(run(fx, ["check", "unknown", "--json"], LAST_DAY_NOW).json.reason, /asked you/); // lang-regex-ok: the governor's own output
+  const opt = run(fx, ["check", "tiny-optional", "--json"], LAST_DAY_NOW);
+  assert.equal(opt.rc, 3, "optional jobs are still held without asking");
+  assert.equal(opt.json.small, undefined);
+});
+
+it("a small run is still asked about earlier in the week, and without the setting on the last day", () => {
+  const early = fixture({ points: HOT, config: SMALL });
+  const e = run(early, ["check", "tiny", "--json"]);
+  assert.equal(e.rc, 3, e.out);
+  assert.match(e.json.reason, /asked you/); // lang-regex-ok: the governor's own output
+  const off = fixture({ points: LAST_DAY, config: { ...SMALL, final_day: { hours: 24, threshold: 0.90 } } });
+  const o = run(off, ["check", "tiny", "--json"], LAST_DAY_NOW);
+  assert.equal(o.rc, 3, o.out);
+  assert.equal(o.json.small, undefined);
+});
