@@ -342,15 +342,35 @@ class HomeDevicesTest(unittest.TestCase):
         self.fake.lan["192.0.2.21"] = "ping"
         self.fake.lan["192.0.2.22"] = "ping"
         self.fake.neigh = [
-            "192.0.2.21 dev br-lan lladdr 02:00:00:00:00:01 REACHABLE",
-            "192.0.2.99 dev br-lan lladdr 02:00:00:00:00:a2 STALE",  # an older address of the extender
-            "192.0.2.22 dev br-lan lladdr 02:00:00:00:00:a2 REACHABLE",  # the fresh one wins
+            "192.0.2.98 dev br-lan lladdr 02:00:00:00:00:01 STALE",  # an older address of the lamp
+            "192.0.2.21 dev br-lan lladdr 02:00:00:00:00:01 REACHABLE",  # the fresh one wins
+            "192.0.2.22 dev br-lan lladdr 02:00:00:00:00:a2 REACHABLE",  # the extender, at one address only
             "fe80::1 dev br-lan lladdr 02:00:00:00:00:03 REACHABLE",  # IPv6 is no evidence
         ]
         res = mod.check_all(mod.roster_cfg())
         self.assertEqual(res["Test lamp"], (True, "192.0.2.21 ping (no lease record, from ARP table)"))
         self.assertEqual(res["Test extender client"], (True, "192.0.2.22 ping (no lease record, from ARP table)"))
         self.assertEqual(res["Test doorbell"], (True, "192.0.2.13 ping"))  # still has its lease
+
+    def test_an_extender_seen_at_several_addresses_is_not_taken_for_one_device(self):
+        # An extender answers for every device behind it, so its MAC at two
+        # addresses does not say which is this device's: it is not taken, and
+        # with half the lease list gone the device is not judged rather than
+        # judged at a guessed address.
+        mod = self.load()
+        del self.fake.leases["02:00:00:00:00:01"]
+        del self.fake.leases["02:00:00:00:00:02"]
+        self.fake.lan["192.0.2.21"] = "ping"
+        self.fake.lan["192.0.2.22"] = "ping"
+        self.fake.neigh = [
+            "192.0.2.21 dev br-lan lladdr 02:00:00:00:00:01 REACHABLE",
+            "192.0.2.99 dev br-lan lladdr 02:00:00:00:00:a2 STALE",
+            "192.0.2.22 dev br-lan lladdr 02:00:00:00:00:a2 REACHABLE",
+        ]
+        res = mod.check_all(mod.roster_cfg())
+        self.assertEqual(res["Test lamp"], (True, "192.0.2.21 ping (no lease record, from ARP table)"))
+        self.assertIsNone(res["Test extender client"][0])
+        self.assertIn("couldn't check", res["Test extender client"][1])
 
     def test_missing_lease_and_no_usable_arp_entry_is_still_down(self):
         mod = self.load()
