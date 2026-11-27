@@ -29,6 +29,8 @@
  *       [--reading "<your reading of it, one or two sentences>"]
  *       [--arrival "<name>=<ISO with offset>"]   when a person the sentence says arrived did arrive
  *                                                (repeatable; the name as it is on the user's companion records)
+ *       [--event "<exact event title>=<ISO from>/<ISO to>"]   when a calendar event the sentence is about
+ *                                                really ran (repeatable; the title exactly as the calendar has it)
  *   day-correction list <YYYY-MM-DD>
  *   day-correction rm <YYYY-MM-DD> <n>                       1-based, as `list` numbers them
  *
@@ -39,6 +41,14 @@
  * one reading language); `daily-summary-build prep` replaces the row-derived time with
  * it for a person already on the stop (lib/daily-summary-harvest.js
  * applyCorrectionArrivals). It never adds a person to a stop: that is `location-annotate`.
+ *
+ * `--event` is how a stated time of a calendar event reaches the day: the timeline prints an
+ * event the user was at ("Cooking, 2:00pm, 2h 30m") with the calendar's own times, and when the
+ * user says "I was cooking from 1pm to 4:30pm" the line must say that. The turn that read the
+ * sentence gives the title (copied from the day's calendar list, never typed from memory) and
+ * the real window; `daily-summary-build prep` then replaces the event's times on every copy of
+ * it the day carries (lib/daily-summary-harvest.js applyCorrectionEventTimes). The calendar
+ * itself is never edited, and an event whose title the day does not carry is left alone.
  *
  * `add` is idempotent on (date, text): the same sentence recorded twice is one
  * entry, so a re-dispatched email turn cannot double it. To add an arrival to a
@@ -94,7 +104,7 @@ if (!isDate(date)) die("second argument must be a YYYY-MM-DD date");
 if (cmd === "list") {
   const rows = readAll(date);
   if (!rows.length) { console.log(`(no corrections recorded for ${date})`); process.exit(0); }
-  rows.forEach((r, i) => console.log(`${i + 1}. [${r.channel}] ${r.applies_from ? `${r.applies_from} → ${r.applies_to}` : "no window"} — ${r.text}${r.arrivals ? ` [arrivals: ${Object.entries(r.arrivals).map(([n, t]) => `${n}=${t}`).join(", ")}]` : ""}`));
+  rows.forEach((r, i) => console.log(`${i + 1}. [${r.channel}] ${r.applies_from ? `${r.applies_from} → ${r.applies_to}` : "no window"} — ${r.text}${r.arrivals ? ` [arrivals: ${Object.entries(r.arrivals).map(([n, t]) => `${n}=${t}`).join(", ")}]` : ""}${r.events ? ` [events: ${Object.entries(r.events).map(([n, w]) => `${n}=${w.from}/${w.to}`).join(", ")}]` : ""}`));
   process.exit(0);
 }
 
@@ -127,6 +137,17 @@ for (const a of allArgs(rest, "--arrival")) {
   arrivals[who] = when;
 }
 
+const events = {};
+for (const a of allArgs(rest, "--event")) {
+  const cut = String(a).lastIndexOf("=");
+  const title = cut > 0 ? a.slice(0, cut).trim() : "";
+  const [evFrom, evTo, ...extra] = (cut > 0 ? a.slice(cut + 1).trim() : "").split("/");
+  if (!title || extra.length || !validIso(evFrom) || !validIso(evTo) || Date.parse(evTo) <= Date.parse(evFrom)) {
+    die("--event must be <exact event title>=<ISO from>/<ISO to>, both with an offset and to after from, e.g. Team lunch=2026-10-10T12:30:00-04:00/2026-10-10T14:00:00-04:00");
+  }
+  events[title] = { from: evFrom, to: evTo };
+}
+
 const rows = readAll(date);
 if (rows.some((r) => r.text === text)) { console.log("already recorded — nothing to do"); process.exit(0); }
 rows.push({
@@ -137,6 +158,7 @@ rows.push({
   ...(arg(rest, "--source") ? { source: arg(rest, "--source") } : {}),
   ...(arg(rest, "--reading") ? { reading: arg(rest, "--reading").trim() } : {}),
   ...(Object.keys(arrivals).length ? { arrivals } : {}),
+  ...(Object.keys(events).length ? { events } : {}),
 });
 writeAll(date, rows);
 console.log(`recorded for ${date} (${rows.length} total)`);

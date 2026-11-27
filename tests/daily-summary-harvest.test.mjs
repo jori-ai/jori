@@ -217,6 +217,63 @@ test("applyCorrectionArrivals: nothing changes without a usable arrival, an unkn
   assert.deepEqual(H.applyCorrectionArrivals(undefined, undefined), []);
 });
 
+test("applyCorrectionEventTimes: the user's window replaces the event's times on every copy of it, and nothing else", () => {
+  const evt = (summary, s, e, extra = {}) => ({ summary, start: `2026-03-14T${s}:00-04:00`, end: `2026-03-14T${e}:00-04:00`, ...extra });
+  const mk = () => ({
+    calendar_busy: [evt("Team lunch", "14:00", "16:30"), evt("Team lunch", "21:00", "22:00"), evt("Walk", "15:00", "15:30")],
+    unmatched_calendar_events: [evt("team lunch ", "14:00", "16:30")],
+    stops: [{ id: "a", calendar_event: evt("Team lunch", "14:00", "16:30", { duration_min: 150 }) }, { id: "b", calendar_event: null }, { id: "c" }],
+  });
+  const day = mk();
+  const applied = H.applyCorrectionEventTimes(day, [
+    { said_at: "2026-03-14T23:25:00Z", text: "lunch ran from 1pm to 4:30pm", events: { "Team lunch": { from: "2026-03-14T13:00:00-04:00", to: "2026-03-14T16:30:00-04:00" } } },
+  ]);
+  assert.equal(applied.length, 3, "the busy copy, the unmatched copy (title matched trimmed and case-folded) and the stop's copy");
+  assert.equal(day.calendar_busy[0].start, "2026-03-14T13:00:00-04:00");
+  assert.equal(day.calendar_busy[0].end, "2026-03-14T16:30:00-04:00");
+  assert.equal(day.unmatched_calendar_events[0].start, "2026-03-14T13:00:00-04:00");
+  assert.equal(day.stops[0].calendar_event.start, "2026-03-14T13:00:00-04:00");
+  assert.equal(day.stops[0].calendar_event.duration_min, 210);
+  assert.equal(day.calendar_busy[1].start, "2026-03-14T21:00:00-04:00", "another event of the same title, hours away, is left alone");
+  assert.equal(day.calendar_busy[2].start, "2026-03-14T15:00:00-04:00", "another title is left alone");
+  assert.deepEqual(H.applyCorrectionEventTimes(day, [{ text: "again", events: { "Team lunch": { from: "2026-03-14T13:00:00-04:00", to: "2026-03-14T16:30:00-04:00" } } }]), [], "idempotent");
+});
+
+test("applyCorrectionEventTimes: nothing changes without a usable window, a title the day carries, or a day", () => {
+  const cases = [
+    [{ text: "no events" }],
+    [{ text: "bad time", events: { "Team lunch": { from: "later", to: "2026-03-14T16:30:00-04:00" } } }],
+    [{ text: "backwards", events: { "Team lunch": { from: "2026-03-14T16:30:00-04:00", to: "2026-03-14T13:00:00-04:00" } } }],
+    [{ text: "not on the day", events: { "Other": { from: "2026-03-14T13:00:00-04:00", to: "2026-03-14T16:30:00-04:00" } } }],
+    [{ text: "too far from the event", events: { "Team lunch": { from: "2026-03-14T07:00:00-04:00", to: "2026-03-14T08:00:00-04:00" } } }],
+    [null],
+  ];
+  for (const c of cases) {
+    const day = { calendar_busy: [{ summary: "Team lunch", start: "2026-03-14T14:00:00-04:00", end: "2026-03-14T16:30:00-04:00" }] };
+    assert.deepEqual(H.applyCorrectionEventTimes(day, c), [], c[0] && c[0].text);
+    assert.equal(day.calendar_busy[0].start, "2026-03-14T14:00:00-04:00");
+  }
+  assert.deepEqual(H.applyCorrectionEventTimes(undefined, undefined), []);
+  assert.deepEqual(H.applyCorrectionEventTimes({}, [{ text: "x", events: { A: { from: "2026-03-14T13:00:00-04:00", to: "2026-03-14T14:00:00-04:00" } } }]), []);
+});
+
+test("day-correction add --event stores it, list shows it, readCorrections returns it; a bad one is refused", () => {
+  const dir = fs.mkdtempSync(path.join(process.env.TMPDIR || "/tmp", "day-corr-evt-"));
+  const bin = path.join(path.dirname(fileURLToPath(import.meta.url)), "../bin/day-correction");
+  const run = (...a) => spawnSync(process.execPath, [bin, ...a], { encoding: "utf8", env: { ...process.env, JORI_DAY_CORRECTIONS_DIR: dir } });
+  const ok = run("add", "2099-03-14", "--text", "I was cooking from 1pm to 4:30pm", "--event", "Cooking=2099-03-14T13:00:00-04:00/2099-03-14T16:30:00-04:00");
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.deepEqual(H.readCorrections("2099-03-14", dir)[0].events, { Cooking: { from: "2099-03-14T13:00:00-04:00", to: "2099-03-14T16:30:00-04:00" } });
+  assert.match(run("list", "2099-03-14").stdout, /events: Cooking=2099-03-14T13:00:00-04:00\/2099-03-14T16:30:00-04:00/);
+  for (const bad of ["Cooking", "=2099-03-14T13:00:00-04:00/2099-03-14T16:30:00-04:00", "Cooking=1pm/4:30pm", "Cooking=2099-03-14T13:00:00-04:00",
+    "Cooking=2099-03-14T16:30:00-04:00/2099-03-14T13:00:00-04:00", "Cooking=2099-03-14T13:00:00/2099-03-14T16:30:00"]) {
+    const r = run("add", "2099-03-14", "--text", `bad ${bad}`, "--event", bad);
+    assert.equal(r.status, 2, bad);
+  }
+  assert.equal(H.readCorrections("2099-03-14", dir).length, 1, "a refused add records nothing");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test("day-correction add --arrival stores it, list shows it, readCorrections returns it; a bad one is refused", () => {
   const dir = fs.mkdtempSync(path.join(process.env.TMPDIR || "/tmp", "day-corr-arr-"));
   const bin = path.join(path.dirname(fileURLToPath(import.meta.url)), "../bin/day-correction");

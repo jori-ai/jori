@@ -51,7 +51,7 @@ const { fetchCompletedTasks, localizeTasksToStops } = require("../lib/daily-summ
 const { dayCommits, routineTags } = require("../lib/daily-summary-commits.js");
 const { request } = require("../lib/supabase-rest.js");
 const { getDisplayTzForDate } = require("../lib/travel-timezone.js");
-const { harvestDay, countColumns, readCorrections, applyCorrectionArrivals } = require("../lib/daily-summary-harvest.js");
+const { harvestDay, countColumns, readCorrections, applyCorrectionArrivals, applyCorrectionEventTimes } = require("../lib/daily-summary-harvest.js");
 const { dayWindow: dayWindowOf, boundaryTzOf, defaultTz } = require("../lib/day-window.js");
 const { installTools } = require("../lib/root.cjs");
 const { crossesZones } = require("../lib/geo-timezone.js");
@@ -331,6 +331,9 @@ async function cmdPrep(date, resolvedOverride, confirmedPath, freshHarvest = fal
   // beats the time of the first visit row that names them, on the stop it falls in.
   // Re-applied on every prep: the resolved day on disk is the phone's reading only.
   applyCorrectionArrivals(resolved.stops, readCorrections(date), resolved.tz);
+  // The time of a calendar event the user gave in their own words (`day-correction add
+  // --event`) beats the calendar's, on every copy of that event the day carries.
+  applyCorrectionEventTimes(resolved, readCorrections(date));
   // Optional agent-vetted overrides: { "<stop_id>": "<confirmed venue>" } — chat
   // statements the agent confirmed. On a re-prep these settle the matching stops
   // before the JSON is re-emitted.
