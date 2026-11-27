@@ -221,3 +221,41 @@ test("a meeting record with no end of its own keeps a short stretch after the pl
     assert.deepEqual(fresh._internal.splitOnMeetings(d, d.stops).stops.map(s => `${s.start}-${s.end}${s._meeting ? " meeting" : ""}`), ["19:13-19:30", "19:30-22:00 meeting", "22:00-22:12"]);
   } finally { delete process.env.JORI_CAL_OPEN_END_TAIL_MIN; delete require.cache[require.resolve(path.join(ROOT, "lib/daily-summary-render.js"))]; }
 });
+
+// A block that opens at a plan-only meeting end starts when the calendar said the meeting would
+// end, which is not a moment the user crossed anything. Its header says "about"; a record with an
+// end of its own is a real boundary and keeps the plain time (2026-11-27: a game planned 7:30 to
+// 10pm, the stay running to midnight, drew a "10:00pm" home block as if the game ended on the dot).
+test("a block that opens at a plan-only meeting end says about; one after a recorded end does not", () => {
+  const record = (over = {}) => ({ summary: "Family game", calendar: { start: iso("19:30"), end: iso("22:00"), location: null },
+    happened: { value: "yes" }, where: { mode: "in_person", place: "Home", stop_id: "s-1" }, start: null, end: null,
+    participants: { names: ["Pat"] }, what: { text: "You played." }, ...over });
+  const build = (rec) => {
+    const home = stop("s-1", "19:13", "23:50", "Home", { address: "12 Palm Way, Springfield" });
+    return { date: "2026-11-25", tz: TZ, tzs: [TZ], stops: [home], travel_legs: [], unmatched_calendar_events: [],
+      calendar_busy: [], meeting_records: { status: "ok", records: [rec] } };
+  };
+  const heads = (d) => [...render.assemble(render.buildSkeleton(d, {}), { prose: {} }).matchAll(/<h[34][^>]*>([\s\S]*?)<\/h[34]>/g)]
+    .map(m => m[1].replace(/<[^>]*>/g, "").trim());
+  const plan = heads(build(record()));
+  assert.equal(plan.length, 3, plan.join(" | "));
+  assert.ok(plan[2].startsWith("about 10:00pm · Home"), plan.join(" | "));
+  assert.ok(!plan[0].startsWith("about"), plan.join(" | "));
+  const real = heads(build(record({ start: iso("19:30"), end: iso("22:00") })));
+  assert.ok(real[real.length - 1].startsWith("10:00pm · Home"), real.join(" | "));
+  // the markdown the wiki reads says it too
+  const md = render.buildMarkdown(build(record()), { prose: {} });
+  assert.match(md, /### about 22:00-23:50/);
+});
+
+// "3 stops" over six headers read as a miscount: the timeline draws each meeting the user was at
+// as its own block inside a stop, so the count names them.
+test("the header count names the meetings drawn as blocks of their own", () => {
+  const caption = (d) => (render.buildSkeleton({ ...d, map_url: "https://example.test/map.png" }, {})
+    .match(/<p style="color:#999;font-size:12px;margin:0 0 16px;">([^<]*)<\/p>/) || [])[1] || "";
+  assert.match(caption(day()), /2 stops · 3 meetings/);
+  // a day with no meeting to draw says nothing about meetings
+  const quiet = caption(day({ calendar_busy: [], unmatched_calendar_events: [] }));
+  assert.match(quiet, /2 stops/);
+  assert.ok(!/meeting/.test(quiet), quiet);
+});
