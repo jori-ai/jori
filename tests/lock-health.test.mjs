@@ -250,7 +250,7 @@ test("upcoming needs: a signed lease starting inside the window, and a code the 
     { status: "completed", terms: { propertySlug: "P1", unitId: "u4", startDate: "2026-10-01T00:00:00Z" } }, // long started
   ];
   const tenants = [
-    { propertySlug: "P1", unitId: "u5", status: "future", leaseStartDate: "2026-11-05T00:00:00Z", ttlockError: "E118 Back: error -2012" },
+    { propertySlug: "P1", unitId: "u5", status: "future", leaseStartDate: "2026-11-05T00:00:00Z", ttlockError: "Back door: error -2012" },
     { propertySlug: "P1", unitId: "u6", status: "former", leaseStartDate: "2026-11-05T00:00:00Z", ttlockError: "old" },
     { propertySlug: "P1", unitId: "u7", status: "current", leaseStartDate: "2026-11-05T00:00:00Z" },
     // Guards the 'Lock problem … needed: 2 codes waiting to be set' alert that
@@ -291,6 +291,91 @@ test("compose: one bullet per lock, property name first, push only for new probl
   assert.equal(rec.push, null, "a recovery posts silently");
   assert.equal(rec.text, "✅ Lock back to normal\n- P2 · Front: no longer offline");
   assert.equal(lh.compose({ alerts: [], recoveries: [] }), null);
+});
+
+// ── repeat pages ────────────────────────────────────────────────────────────
+
+// Guards the identical "🔐 Lock problem … no gateway connected" page that a
+// lock with its own gateway offline posts again and again: the second page and
+// later say they are repeats, and a no-gateway page names the gateway the lock
+// was last seen on. A lock's first page is unchanged.
+const DAY = 24 * HOUR;
+const iso = (agoMs) => new Date(NOW - agoMs).toISOString();
+const alertOf = (over = {}) => ({ lock: "ttlock:1", kind: "unreachable", name: "Back door", property: "P1", text: "the gateway can't reach the lock (dead batteries or out of range)", needs: [], ...over });
+const say = (alerts, extra = {}) => lh.compose({ alerts, recoveries: [], propertyNames: { P1: "Oak House" }, nowMs: NOW, ...extra }).text;
+const FIRST = "🔐 Lock problem, before anyone needs the door\n- Oak House · Back door: the gateway can't reach the lock (dead batteries or out of range)";
+
+test("a first page reads exactly as before, with or without history to look at", () => {
+  assert.equal(say([alertOf()]), FIRST);
+  assert.equal(say([alertOf()], { history: { "ttlock:9|reach": [iso(DAY)] }, lastGateway: { "ttlock:1": { name: "GW" } } }), FIRST);
+});
+
+test("a repeat page keeps the old bullet as its prefix and counts the pages since the earliest one", () => {
+  const needs = [{ why: "code-pending" }];
+  const first = say([alertOf({ needs })]);
+  assert.equal(say([alertOf({ needs })], { history: { "ttlock:1|reach": [iso(5 * DAY)] } }), `${first} · 2nd page for this lock since Oct 30`);
+  const twice = say([alertOf({ needs })], { history: { "ttlock:1|reach": [iso(2 * DAY), iso(10 * DAY)] } });
+  assert.equal(twice, `${first} · 3rd page for this lock since Oct 25`);
+  assert.ok(first.endsWith("1 code waiting to be set"));
+});
+
+test("history older than 14 days is not counted, and the list is capped at 10", () => {
+  assert.equal(say([alertOf()], { history: { "ttlock:1|reach": [iso(15 * DAY)] } }), FIRST);
+  assert.match(say([alertOf()], { history: { "ttlock:1|reach": [iso(15 * DAY), iso(3 * DAY)] } }), /2nd page for this lock since Nov 1$/);
+  const many = Array.from({ length: 12 }, (_, i) => iso((12 - i) * HOUR));
+  assert.deepEqual(lh.pruneHistory(["junk", ...many, iso(20 * DAY), null], NOW), many.slice(-10));
+  assert.deepEqual(lh.pruneHistory([iso(HOUR), iso(3 * HOUR)], NOW), [iso(3 * HOUR), iso(HOUR)], "oldest first");
+  assert.deepEqual(lh.pruneHistory(undefined, NOW), []);
+});
+
+test("recordDelivered adds only the delivered alerts' keys to a copy, pruning the rest", () => {
+  const state = { conditions: { c: 1 }, alert_history: { "ttlock:1|reach": [iso(3 * DAY)], "ttlock:2|reach": [iso(2 * DAY)], "ttlock:3|reach": [iso(20 * DAY)] } };
+  const before = structuredClone(state);
+  const out = lh.recordDelivered(state, [alertOf(), alertOf({ kind: "battery_low", text: "battery 8%" })], NOW);
+  assert.deepEqual(state, before, "the input is not touched");
+  assert.deepEqual(out.alert_history, {
+    "ttlock:1|reach": [iso(3 * DAY), iso(0)], "ttlock:1|battery_low": [iso(0)], "ttlock:2|reach": [iso(2 * DAY)],
+  });
+  assert.deepEqual(out.conditions, { c: 1 });
+  assert.deepEqual(lh.recordDelivered({}, [], NOW), { alert_history: {} }, "nothing delivered records nothing");
+});
+
+test("plan remembers the last online named gateway per lock, and a reading without one keeps it", () => {
+  const stamp = new Date(NOW).toISOString();
+  let r = lh.plan({ readings: [ttl()], state: {}, nowMs: NOW, cfg });
+  assert.deepEqual(r.state.last_gateway, { "ttlock:1": { name: "GW", at: stamp } });
+  const noGw = ttl({ has_gateway: false, gateway: null, probe: null });
+  const off = ttl({ key: "ttlock:2", gateway: { id: 8, name: "Other", online: false } });
+  const unnamed = ttl({ key: "ttlock:3", gateway: { id: 7, name: null, online: true } });
+  const kept = lh.plan({ readings: [noGw, off, unnamed], state: r.state, nowMs: NOW + HOUR, cfg: cfgFast });
+  assert.deepEqual(kept.state.last_gateway, { "ttlock:1": { name: "GW", at: stamp } });
+  const plain = lh.plan({ readings: [noGw, off, unnamed], state: {}, nowMs: NOW + HOUR, cfg: cfgFast });
+  assert.deepEqual([kept.alerts, kept.recoveries, kept.state.conditions], [plain.alerts, plain.recoveries, plain.state.conditions]);
+});
+
+test("a repeat no-gateway page names the last gateway; no other kind, and no first page, does", () => {
+  const noGw = alertOf({ kind: "no_gateway", text: "no gateway connected, so codes can't be sent to it" });
+  const lastGateway = { "ttlock:1": { name: "Next-door GW", at: iso(DAY) } };
+  const history = { "ttlock:1|reach": [iso(5 * DAY)] };
+  const bullet = "- Oak House · Back door: no gateway connected, so codes can't be sent to it";
+  assert.ok(say([noGw], { history, lastGateway }).endsWith(`${bullet} · 2nd page for this lock since Oct 30 (last seen paired with Next-door GW)`));
+  assert.ok(say([noGw], { lastGateway }).endsWith(bullet), "a first page is as before");
+  assert.ok(say([noGw], { history }).endsWith("since Oct 30"), "no known gateway, no parenthesis");
+  assert.ok(!say([alertOf()], { history, lastGateway }).includes("last seen"), "only a no-gateway page names it");
+});
+
+test("recovery lines do not change when history is passed", () => {
+  const recoveries = [{ lock: "schlage:front", kind: "offline", name: "Front", property: "P2", text: "offline (its cloud can't reach it)" }];
+  const history = { "schlage:front|offline": [iso(DAY)], "ttlock:1|reach": [iso(DAY)] };
+  assert.deepEqual(lh.compose({ alerts: [], recoveries, history, lastGateway: {}, nowMs: NOW }), lh.compose({ alerts: [], recoveries }));
+  const both = lh.compose({ alerts: [alertOf()], recoveries, history, nowMs: NOW });
+  assert.ok(both.text.endsWith("\n\n✅ Lock back to normal\n- P2 · Front: no longer offline"));
+  assert.equal(both.push, "Lock problem: P1 · Back door");
+});
+
+test("ordinal", () => {
+  const got = [1, 2, 3, 4, 11, 12, 13, 21, 22, 23].map(lh.ordinal);
+  assert.deepEqual(got, ["1st", "2nd", "3rd", "4th", "11th", "12th", "13th", "21st", "22nd", "23rd"]);
 });
 
 test("preflightVerdict reports blips too, and an unknown property as not ok", () => {
