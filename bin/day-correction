@@ -31,6 +31,11 @@
  *                                                (repeatable; the name as it is on the user's companion records)
  *       [--event "<exact event title>=<ISO from>/<ISO to>"]   when a calendar event the sentence is about
  *                                                really ran (repeatable; the title exactly as the calendar has it)
+ *       [--event-happened "<title>=yes|no|partly"]   whether that event took place
+ *       [--event-how "<title>=in_person|zoom|meet|teams|phone|facetime|other"]   how the user took part
+ *       [--event-where "<title>=<the place, in the user's words>"]   where it was held
+ *       [--event-with "<title>=<name>, <name>"]   who actually took part (the household included)
+ *       [--event-what "<title>=<one or two sentences>"]   what took place
  *   day-correction list <YYYY-MM-DD>
  *   day-correction rm <YYYY-MM-DD> <n>                       1-based, as `list` numbers them
  *
@@ -50,8 +55,16 @@
  * it the day carries (lib/daily-summary-harvest.js applyCorrectionEventTimes). The calendar
  * itself is never edited, and an event whose title the day does not carry is left alone.
  *
- * `add` is idempotent on (date, text): the same sentence recorded twice is one
- * entry, so a re-dispatched email turn cannot double it. To add an arrival to a
+ * `--event-happened/-how/-where/-with/-what` are the rest of the user's word on a calendar event
+ * (2026-11-27, the meeting records): did it happen, how and where, who took part, what took
+ * place. They are stored beside `--event`'s window under the same title, and bin/meeting-record
+ * applies them on top of every other signal (lib/meeting-record.mjs applyCorrections), so every
+ * later render of the day uses them. The turn that read the user's words fills them (it is the one
+ * reading language); `meeting-record file-answers` does it for a reply to its own question.
+ *
+ * `add` is idempotent on (date, text, source): the same sentence from the same source recorded
+ * twice is one entry, so a re-dispatched email turn cannot double it, while the same short
+ * reply to two different questions (two sources) is two. To add an arrival to a
  * sentence already recorded, `rm` it and `add` it again with the flag.
  * After recording, re-render with `daily-summary-run <date>` (or `SILENT`).
  */
@@ -104,7 +117,10 @@ if (!isDate(date)) die("second argument must be a YYYY-MM-DD date");
 if (cmd === "list") {
   const rows = readAll(date);
   if (!rows.length) { console.log(`(no corrections recorded for ${date})`); process.exit(0); }
-  rows.forEach((r, i) => console.log(`${i + 1}. [${r.channel}] ${r.applies_from ? `${r.applies_from} → ${r.applies_to}` : "no window"} — ${r.text}${r.arrivals ? ` [arrivals: ${Object.entries(r.arrivals).map(([n, t]) => `${n}=${t}`).join(", ")}]` : ""}${r.events ? ` [events: ${Object.entries(r.events).map(([n, w]) => `${n}=${w.from}/${w.to}`).join(", ")}]` : ""}`));
+  const evText = (w) => [w.from ? `${w.from}/${w.to}` : null, w.happened ? `happened ${w.happened}` : null, w.how ? `how ${w.how}` : null,
+    w.where ? `where ${w.where}` : null, (w.participants || []).length ? `with ${w.participants.join(", ")}` : null, w.what ? `what: ${w.what}` : null]
+    .filter(Boolean).join("; ");
+  rows.forEach((r, i) => console.log(`${i + 1}. [${r.channel}] ${r.applies_from ? `${r.applies_from} → ${r.applies_to}` : "no window"} — ${r.text}${r.arrivals ? ` [arrivals: ${Object.entries(r.arrivals).map(([n, t]) => `${n}=${t}`).join(", ")}]` : ""}${r.events ? ` [events: ${Object.entries(r.events).map(([n, w]) => `${n}=${evText(w)}`).join(", ")}]` : ""}`));
   process.exit(0);
 }
 
@@ -148,8 +164,28 @@ for (const a of allArgs(rest, "--event")) {
   events[title] = { from: evFrom, to: evTo };
 }
 
+// The rest of the user's word on an event, under the same title.
+const HOWS = ["in_person", "zoom", "meet", "teams", "phone", "facetime", "other"];
+const eventFact = (flagName, key, check, parse = (v) => v) => {
+  for (const a of allArgs(rest, flagName)) {
+    const cut = String(a).indexOf("=");
+    const title = cut > 0 ? a.slice(0, cut).trim() : "";
+    const value = cut > 0 ? a.slice(cut + 1).trim() : "";
+    if (!title || !value || !check(value)) die(`${flagName} must be <exact event title>=<${key === "happened" ? "yes|no|partly" : key === "how" ? HOWS.join("|") : key}>`);
+    events[title] = { ...(events[title] || {}), [key]: parse(value) };
+  }
+};
+eventFact("--event-happened", "happened", (v) => ["yes", "no", "partly"].includes(v));
+eventFact("--event-how", "how", (v) => HOWS.includes(v));
+eventFact("--event-where", "where", (v) => v.length <= 200);
+eventFact("--event-with", "participants", (v) => v.length <= 400, (v) => v.split(",").map((x) => x.trim()).filter(Boolean));
+eventFact("--event-what", "what", (v) => v.length <= 400);
+
 const rows = readAll(date);
-if (rows.some((r) => r.text === text)) { console.log("already recorded — nothing to do"); process.exit(0); }
+// The same words from the same source are one entry. A source (an email's id, an answer's
+// question) keeps two identical replies about two different events apart ("No, it didn't happen").
+const source = arg(rest, "--source") || null;
+if (rows.some((r) => r.text === text && (r.source || null) === source)) { console.log("already recorded — nothing to do"); process.exit(0); }
 rows.push({
   said_at: saidAt || new Date().toISOString(),
   channel: arg(rest, "--channel") || "email",

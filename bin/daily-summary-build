@@ -278,6 +278,62 @@ async function attachCalls(date, resolved) {
   await hook.attachCalls({ date, tz: boundaryTzOf(resolved), resolved, tmp: TMP, bin: BIN, boundaryTzOf });
 }
 
+// The day's meeting records (bin/meeting-record, lib/meeting-record.mjs;
+// 2026-11-27, the user: "calendar meetings do not accurately reflect real life.
+// We can't place them in the spine automatically."). For each timed meeting or
+// engagement of the day a model settles, from every signal Jori has, whether it
+// happened, where and how, when it really began and ended, who took part and
+// what took place; the render draws a meeting block only from a record that
+// says it happened, at the record's own times and place. The step runs here,
+// with the settled stops, when its file is missing or older than the user's
+// words, the day's corrections, or a reply to one of its questions; a failed
+// run is not retried for an hour. With no file the day's meetings are listed
+// as scheduled and none is drawn (status "failed"). Then any question a record
+// carries is offered to `meeting-record ask`, which keeps quiet hours and
+// pacing itself. JORI_MEETING_RECORDS=0 restores the calendar-and-GPS
+// placement (no records on the day); JORI_MEETING_RECORD_ASK=0 asks nothing.
+function attachMeetingRecords(date, resolved, tz) {
+  if (process.env.JORI_MEETING_RECORDS === "0") { delete resolved.meeting_records; return; }
+  const out = path.join(TMP, `meeting-records-${date}.json`), failed = `${out}.failed`;
+  const mtime = (p) => { try { return fs.statSync(p).mtimeMs; } catch { return 0; } };
+  const { DAY_CORRECTIONS_DIR } = require("../lib/daily-summary-harvest.js");
+  const inputs = [path.join(TMP, `day-statements-${date}.json`), path.join(DAY_CORRECTIONS_DIR, `${date}.jsonl`)];
+  try {
+    const st = JSON.parse(fs.readFileSync(require("../lib/root.cjs").installTools("data/meeting-records/state.json"), "utf8"));
+    if (Object.values(st.questions || {}).some((q) => q.date === date && q.status === "asked")) {
+      inputs.push(require("../lib/root.cjs").installTools("data/hum-responses.jsonl"));
+    }
+  } catch {}
+  let have = null;
+  try { have = JSON.parse(fs.readFileSync(out, "utf8")); } catch {}
+  // A file whose reading failed is tried again (at most once an hour, by the marker below).
+  const stale = !have || have.date !== date || have.status !== "ok" || inputs.some((p) => mtime(p) > mtime(out));
+  if (stale && !(Date.now() - mtime(failed) < 3600_000)) {
+    const dayFile = path.join(TMP, `ds-day-${date}.for-records.json`);
+    try { fs.writeFileSync(dayFile, JSON.stringify(resolved)); } catch {}
+    const r = spawnSync(path.join(BIN, "meeting-record"), [date, "--tz", tz, "--day", dayFile],
+      { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 900_000 });
+    try { have = JSON.parse(fs.readFileSync(out, "utf8")); } catch { have = null; }
+    if (!have || have.date !== date || r.status !== 0) {
+      try { fs.writeFileSync(failed, new Date().toISOString() + "\n"); } catch {}
+      process.stderr.write(`[daily-summary-build] meeting-record ${date} did not finish (exit ${r.status}): `
+        + `${(r.stderr || r.error || "").toString().trim().slice(-300)}${have && have.date === date ? "; using what it wrote" : "; meetings are listed as scheduled"}\n`);
+    } else {
+      try { fs.rmSync(failed, { force: true }); } catch {}
+    }
+  }
+  if (have && have.date === date) {
+    resolved.meeting_records = { status: have.status || "ok", generated_at: have.generated_at, read_by: have.read_by || null,
+      records: have.records || [], skipped: have.skipped || [] };
+  } else {
+    resolved.meeting_records = { status: "failed", generated_at: null, read_by: null, records: [], skipped: [] };
+  }
+  if (process.env.JORI_MEETING_RECORD_ASK !== "0" && (resolved.meeting_records.records || []).some((x) => x.question)) {
+    const a = spawnSync(path.join(BIN, "meeting-record"), ["ask"], { encoding: "utf8", timeout: 180_000 });
+    if (a.status !== 0) process.stderr.write(`[daily-summary-build] meeting-record ask exit ${a.status}: ${(a.stderr || "").trim().slice(-200)}\n`);
+  }
+}
+
 // The day's decisions (an installation's own record of what the user decided
 // that day in some area it tracks): a list at the bottom of the report, never
 // stops. The hook lib/_ext/day-decisions.mjs exports attachDecisions({ date,
@@ -386,6 +442,7 @@ async function cmdPrep(date, resolvedOverride, confirmedPath, freshHarvest = fal
     resolved.tasks_completed = localizeTasksToStops(resolved.tasks_completed, resolved.stops, tz);
   }
   await attachCalls(date, resolved);
+  attachMeetingRecords(date, resolved, boundaryTzOf(resolved, tz));
   await attachDecisions(date, resolved);
   await attachHeldDigests(date, resolved);
   // A place-less event that missed every stop by minutes is the stop the person it
