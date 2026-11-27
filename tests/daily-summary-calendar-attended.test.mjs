@@ -34,12 +34,12 @@ function stop(id, s, e, title, extra = {}) {
 }
 
 const STANDUP = ev("Team standup", "09:30", "10:00", { location: "https://zoom.us/j/123" });
-const DAN = ev("Dan / Moshe catch-up", "11:00", "12:00");
-const PLUMBER = ev("Plumber", "14:00", "15:00", { location: "12 Palm Way, Miami" });
+const DAN = ev("Dan / Sam catch-up", "11:00", "12:00");
+const PLUMBER = ev("Plumber", "14:00", "15:00", { location: "12 Palm Way, Springfield" });
 const DINNER = ev("Dinner at Bistro Example", "19:00", "21:00", { location: "Bistro Example, Brickell" });
 
 function day(extra = {}) {
-  const home = stop("s-1", "07:00", "18:30", "Home", { address: "12 Palm Way, Miami",
+  const home = stop("s-1", "07:00", "18:30", "Home", { address: "12 Palm Way, Springfield",
     calendar_event: { ...DAN, location_match: false, duration_min: 60, event_share: 1 } });
   const bistro = stop("s-2", "19:05", "21:10", "Bistro Example", {
     calendar_event: { ...DINNER, location_match: true, physical: true, duration_min: 120, event_share: 1 } });
@@ -51,7 +51,7 @@ function day(extra = {}) {
 test("a meeting at the home stop splits it into blocks: Home, Meeting, Home", () => {
   const d = day();
   const a = attendedEvents(d);
-  assert.deepEqual((a.byStop["s-1"] || []).map(e => e.summary), ["Team standup", "Dan / Moshe catch-up", "Plumber"]);
+  assert.deepEqual((a.byStop["s-1"] || []).map(e => e.summary), ["Team standup", "Dan / Sam catch-up", "Plumber"]);
   // the dinner IS the bistro stop: its header, not a block of its own
   assert.equal(a.byStop["s-2"], undefined);
   const html = render.assemble(render.buildSkeleton(d, {}), { prose: { "s-1": "A day at home." } });
@@ -60,7 +60,7 @@ test("a meeting at the home stop splits it into blocks: Home, Meeting, Home", ()
     "7:00am · Home",
     "9:30am · Team standup · 30 min · at Home",
     "10:00am · Home",
-    "11:00am · Dan / Moshe catch-up · 1h · at Home",
+    "11:00am · Dan / Sam catch-up · 1h · at Home",
     "12:00pm · Home",
     "2:00pm · Plumber · 1h · at Home",
     "3:00pm · Home",
@@ -78,7 +78,7 @@ test("JORI_CAL_SPLIT=0 lists each one as a line under its stop instead", () => {
   process.env.JORI_CAL_SPLIT = "0";
   try {
     const html = render.assemble(render.buildSkeleton(day(), {}), {});
-    for (const t of ["9:30am-10:00am</b> Team standup · 30 min", "11:00am-12:00pm</b> Dan / Moshe catch-up · 1h", "2:00pm-3:00pm</b> Plumber · 1h"]) {
+    for (const t of ["9:30am-10:00am</b> Team standup · 30 min", "11:00am-12:00pm</b> Dan / Sam catch-up · 1h", "2:00pm-3:00pm</b> Plumber · 1h"]) {
       assert.ok(html.includes(t), `${t}\n${html}`);
     }
     assert.ok(!html.includes('class="meeting"'));
@@ -97,6 +97,39 @@ test("a meeting at the start of a stop opens it; the stop's prose goes to the ne
   assert.equal(stops[0].id, "s-1~0");
 });
 
+test("a meeting that began before the user reached the stop is headed with the arrival and the time from then", () => {
+  // the stop opens at 19:13, the event began at 19:00 and ends at 21:00 (an hour and 47 minutes of it was at the stop)
+  const game = ev("Family game night", "19:00", "21:00");
+  const home = stop("s-1", "19:13", "22:12", "Home", { address: "12 Example Street",
+    calendar_event: { ...game, location_match: false, duration_min: 120, event_share: 0.89, attached_late: true } });
+  const d = { date: "2026-11-25", tz: TZ, tzs: [TZ], stops: [home], travel_legs: [], unmatched_calendar_events: [], calendar_busy: [game] };
+  const html = render.assemble(render.buildSkeleton(d, {}), { prose: { "s-1": "An evening in." } });
+  const heads = [...html.matchAll(/<h[34][^>]*>([\s\S]*?)<\/h[34]>/g)].map(m => m[1].replace(/<[^>]*>/g, "").trim());
+  assert.deepEqual(heads, ["7:13pm · Family game night · 1h 47m · at Home", "9:00pm · Home"],
+    "the event's own 7:00pm start and 2h length are not the part the user was at");
+  const md = render.buildMarkdown(d, { prose: { "s-1": "An evening in." } });
+  assert.ok(md.includes("### 19:13-21:00 · **Family game night** · 1h 47m"), md);
+  // an event inside the stop keeps its own times
+  const inside = ev("Family game night", "19:30", "20:30");
+  const d2 = { ...d, calendar_busy: [inside] };
+  const heads2 = [...render.assemble(render.buildSkeleton(d2, {}), {}).matchAll(/<h[34][^>]*>([\s\S]*?)<\/h[34]>/g)].map(m => m[1].replace(/<[^>]*>/g, "").trim());
+  assert.ok(heads2.includes("7:30pm · Family game night · 1h · at Home"), heads2.join(" | "));
+});
+
+test("a time the user stated for an event replaces the calendar's on every copy, and the block follows it", () => {
+  const { applyCorrectionEventTimes } = require(path.join(ROOT, "lib/daily-summary-harvest.js"));
+  const cook = ev("Cooking", "14:00", "16:30");
+  const home = stop("s-1", "07:45", "19:01", "Home", { address: "12 Example Street", calendar_event: { ...cook, location_match: false, duration_min: 150, event_share: 1 } });
+  const d = { date: "2026-11-25", tz: TZ, tzs: [TZ], stops: [home], travel_legs: [], unmatched_calendar_events: [], calendar_busy: [cook] };
+  const heads = (x) => [...render.assemble(render.buildSkeleton(x, {}), {}).matchAll(/<h[34][^>]*>([\s\S]*?)<\/h[34]>/g)].map(m => m[1].replace(/<[^>]*>/g, "").trim());
+  assert.ok(heads(d).includes("2:00pm · Cooking · 2h 30m · at Home"), heads(d).join(" | "));
+  const applied = applyCorrectionEventTimes(d, [{ said_at: iso("19:25"), text: "I was cooking from 1pm to 4:30pm", events: { Cooking: { from: iso("13:00"), to: iso("16:30") } } }]);
+  assert.equal(applied.length, 2, "the busy list's copy and the stop's copy");
+  assert.deepEqual(heads(d), ["7:45am · Home", "1:00pm · Cooking · 3h 30m · at Home", "4:30pm · Home"]);
+  assert.equal(home.calendar_event.duration_min, 210);
+  assert.equal((attendedEvents(d).byStop["s-1"] || []).length, 1, "still one event, not the corrected one beside the original");
+});
+
 test("the wiki page splits the same way, and the manifest carries them on the stop", () => {
   const d = day();
   const md = render.buildMarkdown(d, {});
@@ -105,7 +138,7 @@ test("the wiki page splits the same way, and the manifest carries them on the st
   assert.ok(md.includes("### 15:00-18:30 · **Home**"), md);
   const m = render.buildManifest(d, {});
   assert.equal(m.stops.length, 2);
-  assert.deepEqual(m.stops[0].calendar_attended.map(e => e.summary), ["Team standup", "Dan / Moshe catch-up", "Plumber"]);
+  assert.deepEqual(m.stops[0].calendar_attended.map(e => e.summary), ["Team standup", "Dan / Sam catch-up", "Plumber"]);
   assert.deepEqual(m.unmatched_calendar_events, []);
 });
 
@@ -122,7 +155,7 @@ test("free events, and a day resolved before calendar_busy, list nothing new", (
   assert.deepEqual(attendedEvents(d).byStop, {});
   // the old behaviour stands: the standup and plumber are unmatched, Dan is on your calendar
   assert.deepEqual(eventsNotMatched(d).map(e => e.summary), ["Team standup", "Plumber"]);
-  assert.equal(heldCalendarEvent(d, d.stops[0]).summary, "Dan / Moshe catch-up");
+  assert.equal(heldCalendarEvent(d, d.stops[0]).summary, "Dan / Sam catch-up");
 });
 
 test("an event no stop holds half of is not listed as attended", () => {
