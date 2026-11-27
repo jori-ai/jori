@@ -76,7 +76,8 @@
 // Claude only, never Jev: money and health messages pass through here too.
 //
 // Stdin:  {message, intent?, sender? (role id), kind?: "proactive"|"reply"|"report",
-//          reply_to_text?, channel?, supporting_data?, fixed_choices? (a card's
+//          reply_to_text?, replied_to? ({role, text, at}: the message a threaded
+//          reply points at), channel?, supporting_data?, fixed_choices? (a card's
 //          option labels), as_of? (replay)}
 // Stdout: {verdict, message?, research_plan?, reason, checks, sources, ms, evidence_ms?,
 //          rewrite_added_claim?, rewrite_claims?, original_trimmed?}; a checked rewrite carries
@@ -289,9 +290,16 @@ const E = (title, body) => (body && String(body).trim() ? `\n## ${title}\n${Stri
 // Everything the judge is shown besides the message and its instructions. The
 // rewrite check reads the same text, so a claim the judge could take from it
 // is never counted as added.
+function repliedTo(input) {
+  const r = input.replied_to;
+  if (!r || !String(r.text || "").trim()) return "";
+  const whose = r.role === "user" ? `${OWNER}'s own earlier message` : `an earlier message of ${ASSISTANT}'s`;
+  return `${whose}${r.at ? ` (${r.at})` : ""}:\n"""${String(r.text).slice(0, 1200)}"""`;
+}
+
 function evidenceText(input, ev, extra) {
   const reply = input.kind === "reply" || input.kind === "report";
-  return `${E("TAPPABLE CHOICES SENT WITH IT (fixed: a rewrite must still be a question these answer)", Array.isArray(input.fixed_choices) ? input.fixed_choices.join(" | ") : "")}${reply ? E(`WHAT ${OWNER.toUpperCase()} WROTE (being answered)`, input.reply_to_text) : ""}${E("THIS ROLE'S CONVERSATION, LAST 14 DAYS (question states are authoritative)", extra.thread)}${E("QUESTIONS STILL OPEN (any role)", extra.open)}${E("NEWEST RECORDS (read by code just before you; they may be newer than a search reaches, and a claim they contradict is false)", extra.recent)}${E(FINANCE_EVIDENCE_TITLE, extra.finance)}${E(`EARLIER WORK DONE FOR ${OWNER.toUpperCase()} (work records: the newest record and its updates win; a superseded recommendation is not the current one; work-record show <id> has the full text)`, extra.work)}${E("ANSWERS THIS GATE ALREADY FOUND (a question it held because it found the answer; asking one again is a re-ask: resolve it with the same answer)", extra.found)}${E(`WHAT ${OWNER.toUpperCase()} SAID (dated, from the reply log)`, ev.owner_said)}${E("TRAVEL TIMELINE FACTS", ev.authoritative_facts)}${E("TRAVEL CHECK FLAGGED (code paired a place and a date; decide yourself whether the message actually claims where the user is)", ev.travel_check_flagged)}${E("LONG-TERM MEMORY (wiki hits)", ev.long_term_memory)}${E("TOPICS ACKNOWLEDGED IN THE LAST 48H", ev.acknowledged_topics_48h)}${E("PINGS ALREADY SENT TODAY", ev.hum_pings_today)}${E("SENDER'S SUPPORTING DATA", ev.supporting_data)}${E("CHAT, LAST 8H", ev.transcript_last_8h)}${E("CALENDAR, REST OF TODAY", ev.calendar_today)}`;
+  return `${E("TAPPABLE CHOICES SENT WITH IT (fixed: a rewrite must still be a question these answer)", Array.isArray(input.fixed_choices) ? input.fixed_choices.join(" | ") : "")}${reply ? E(`WHAT ${OWNER.toUpperCase()} WROTE (being answered)`, input.reply_to_text) : ""}${reply ? E(`THE MESSAGE ${OWNER.toUpperCase()} REPLIED TO (they tapped Reply on it: what they wrote answers THIS, not the newest message in the chat)`, repliedTo(input)) : ""}${E("THIS ROLE'S CONVERSATION, LAST 14 DAYS (question states are authoritative)", extra.thread)}${E("QUESTIONS STILL OPEN (any role)", extra.open)}${E("NEWEST RECORDS (read by code just before you; they may be newer than a search reaches, and a claim they contradict is false)", extra.recent)}${E(FINANCE_EVIDENCE_TITLE, extra.finance)}${E(`EARLIER WORK DONE FOR ${OWNER.toUpperCase()} (work records: the newest record and its updates win; a superseded recommendation is not the current one; work-record show <id> has the full text)`, extra.work)}${E("ANSWERS THIS GATE ALREADY FOUND (a question it held because it found the answer; asking one again is a re-ask: resolve it with the same answer)", extra.found)}${E(`WHAT ${OWNER.toUpperCase()} SAID (dated, from the reply log)`, ev.owner_said)}${E("TRAVEL TIMELINE FACTS", ev.authoritative_facts)}${E("TRAVEL CHECK FLAGGED (code paired a place and a date; decide yourself whether the message actually claims where the user is)", ev.travel_check_flagged)}${E("LONG-TERM MEMORY (wiki hits)", ev.long_term_memory)}${E("TOPICS ACKNOWLEDGED IN THE LAST 48H", ev.acknowledged_topics_48h)}${E("PINGS ALREADY SENT TODAY", ev.hum_pings_today)}${E("SENDER'S SUPPORTING DATA", ev.supporting_data)}${E("CHAT, LAST 8H", ev.transcript_last_8h)}${E("CALENDAR, REST OF TODAY", ev.calendar_today)}`;
 }
 
 function prompt(input, ev, extra) {
@@ -309,7 +317,8 @@ function prompt(input, ev, extra) {
 A report is NEVER dropped or held: the verdict is "send" or "rewrite". For "rewrite", "message" is the corrected text of only the parts you would change, each as "<what it said> → <what it should say>", one per line.`
     : reply
     ? `This is a REPLY to something ${OWNER} just wrote. Two questions:
-1. TRUE — verify every factual claim against the sources (tools below). A claim the sources contradict, or a hedge ("I can't tell whether…", "tell me if…") where the answer is findable, must be fixed — find the answer and put it in.
+1. TRUE — verify every factual claim against the sources (tools below). A claim the sources contradict, or a hedge ("I can't tell whether…", "tell me if…") where the answer is findable, must be fixed — find the answer and put it in.${input.replied_to ? `
+THREADED REPLY: ${OWNER} tapped Reply on a specific earlier message (shown below under THE MESSAGE ${OWNER.toUpperCase()} REPLIED TO). Their words answer THAT message. Never read them against a newer question, a pending question, or the order of the chat, and never rewrite the reply so that it is about a different question than the one they replied to.` : ""}
 3. PHRASING — answers what ${OWNER} asked, directly, short, plain.
 A reply is NEVER dropped, held or sent back: the verdict is "send" or "rewrite".`
     : `This is a PROACTIVE message — ${OWNER} did not ask for it. Think before you speak. Four questions:

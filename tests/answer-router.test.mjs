@@ -263,3 +263,29 @@ test("a typed reply to a decision card or a build question gets its filing line 
   const ext = { metadata: { choices: { kind: "mine", ref: "x1" } } };
   assert.equal(cardReplyHint(ext, { mine: (p) => `hint for ${p.ref}` }), "hint for x1");
 });
+
+// 2026-11-27: "went kayaking with everyone", the answer to a location question
+// (a lane the router does not file), was filed against the only question the
+// router was shown, an older lunch follow-up. The unfiled questions are now
+// shown too, and picking one files nothing.
+test("a message answering a question no flow files is shown that question and files nothing", async () => {
+  const f = fakeFlow([{ question: "How was lunch with everyone?" }]);
+  let seen = "";
+  const unfiled = [{ flow: null, ref: "q-place", question: "Was that a walk on the river trail, or did you stop at the bistro?", asked_at: iso(5), msg_ids: [] }];
+  const r = await AR.routeAnswer({ messageId: mid(), text: "Went kayaking with everyone", flows: [f], unfiled,
+    ask: async (p) => { seen = p; return '{"answers":[2]}'; } });
+  assert.ok(seen.includes("[2]") && seen.includes("river trail"));
+  assert.equal(r.status, "none");
+  assert.deepEqual(r.answers_unfiled, ["q-place"]);
+  assert.equal(f.filed.length, 0);
+});
+
+test("a threaded reply's prompt quotes the message replied to and marks its question", () => {
+  const p = AR.answerPrompt({
+    asks: [{ question: "How was lunch?", asked_at: iso(120), msg_ids: ["m-lunch"] }, { question: "Did you stop at the bistro?", asked_at: iso(10), msg_ids: ["m-place"] }],
+    text: "Yes. We did.", replyTo: "m-lunch", repliedToText: "How was lunch?",
+  });
+  assert.ok(p.includes("tapped Reply on this earlier message"));
+  assert.ok(p.includes("[1] (asked") && p.split("\n").find((l) => l.startsWith("[1]")).includes("THE MESSAGE THE USER REPLIED TO"));
+  assert.ok(!p.split("\n").find((l) => l.startsWith("[2]")).includes("REPLIED TO"));
+});
