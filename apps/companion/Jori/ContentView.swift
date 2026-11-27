@@ -2196,6 +2196,8 @@ struct MessageBubble: View, Equatable {
     @State private var dragX: CGFloat = 0
     @State private var replyArmed = false
     @State private var reactionTick = 0
+    /// Flips the hover bar's Copy icon to a checkmark for a moment.
+    @State private var justCopied = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     init(message: Message,
@@ -2359,11 +2361,34 @@ struct MessageBubble: View, Equatable {
             }
             .buttonStyle(PressableStyle(pressedScale: 0.8))
             .help("Reply")
+            // The whole message in one click. On the Mac, right-clicking a
+            // selectable paragraph opens the text menu for that paragraph
+            // only, and a drag selection stops at each paragraph, so there
+            // was no way to copy a long answer whole.
+            Button { copyWholeMessage() } label: {
+                Image(systemName: justCopied ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(justCopied ? AnyShapeStyle(JoriTheme.cobalt) : AnyShapeStyle(.secondary))
+                    .frame(width: 28, height: 26)
+                    .contentTransition(.symbolEffect(.replace))
+            }
+            .buttonStyle(PressableStyle(pressedScale: 0.8))
+            .help(justCopied ? "Copied" : "Copy message")
+            .accessibilityLabel("Copy message")
         }
         .padding(.horizontal, 4)
         .padding(.vertical, 2)
         .glassSurface(in: Capsule())
         .shadow(color: .black.opacity(0.1), radius: 6, y: 2)
+    }
+
+    private func copyWholeMessage() {
+        copyToPasteboard(message.content)
+        withAnimation(.easeOut(duration: 0.15)) { justCopied = true }
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1.2))
+            withAnimation(.easeOut(duration: 0.2)) { justCopied = false }
+        }
     }
 
     // MARK: Touch — swipe right to reply
@@ -2644,7 +2669,7 @@ struct MessageBubble: View, Equatable {
             Button {
                 copyToPasteboard(message.content)
             } label: {
-                Label("Copy", systemImage: "doc.on.doc")
+                Label("Copy Message", systemImage: "doc.on.doc")
             }
             // Hand the text to the system share sheet (Messages, Mail,
             // WhatsApp, AirDrop…) to pass a Jori answer on to someone.
