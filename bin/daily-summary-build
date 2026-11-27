@@ -43,7 +43,7 @@
 const fs = require("fs");
 const path = require("path");
 const { spawnSync } = require("child_process");
-const { buildManifest, buildSkeleton, assemble, photosNotShown, attachNearMissEvents, _internal: { isMainStop } } = require("../lib/daily-summary-render.js");
+const { buildManifest, buildSkeleton, assemble, photosNotShown, attachNearMissEvents, skeletonBlocks, _internal: { isMainStop } } = require("../lib/daily-summary-render.js");
 const { selectStandouts, chargesOfDay } = require("../lib/daily-summary-transactions.js");
 const { linkStandoutsToStops, placesBesidePhotos } = require("../lib/standout-stop-link.js");
 const { settleDay } = require("../lib/daily-summary-day.js");
@@ -482,11 +482,18 @@ function cmdRender(date) {
   try { day = JSON.parse(fs.readFileSync(dayPath, "utf8")); }
   catch (e) { die(`render: bad day JSON at ${dayPath}: ${e.message}`); }
 
-  const photoHtmlById = {}, notShownById = {};
-  for (const s of day.stops || []) {
+  // A stop a meeting split into blocks (splitOnMeetings) shows each photo in the
+  // block its time falls in, so photos are embedded per block, and the manifest's
+  // per-stop flags below read all of a stop's blocks.
+  const photoHtmlById = {}, notShownById = {}, blockIdsOf = {};
+  const blocks = skeletonBlocks(day);
+  const shown = new Set(blocks.map(b => b._piece_of || b.id));
+  for (const b of blocks) (blockIdsOf[b._piece_of || b.id] = blockIdsOf[b._piece_of || b.id] || []).push(b.id);
+  for (const s of [...blocks, ...(day.stops || []).filter(x => !shown.has(x.id))]) {
     const p = renderStopPhotos(s);
     photoHtmlById[s.id] = p.html;
     notShownById[s.id] = p.notShown;
+    if (!blockIdsOf[s._piece_of || s.id]) blockIdsOf[s._piece_of || s.id] = [s.id];
   }
   const skeleton = buildSkeleton(day, photoHtmlById);
   fs.writeFileSync(path.join(TMP, `ds-skeleton-${date}.html`), skeleton);
@@ -498,8 +505,9 @@ function cmdRender(date) {
     try {
       const manifest = JSON.parse(fs.readFileSync(manPath, "utf8"));
       for (const m of manifest.stops) {
-        m.photos_rendered = !!(photoHtmlById[m.id] && photoHtmlById[m.id].trim());
-        m.photos_not_shown = notShownById[m.id] || [];
+        const ids = blockIdsOf[m.id] || [m.id];
+        m.photos_rendered = ids.some(id => !!(photoHtmlById[id] && photoHtmlById[id].trim()));
+        m.photos_not_shown = ids.flatMap(id => notShownById[id] || []);
       }
       fs.writeFileSync(manPath, JSON.stringify(manifest, null, 2));
     } catch (e) {
@@ -568,10 +576,13 @@ async function cmdPublish(date, prosePath, force = false) {
   }
   const DISPLAY = new Set(["photo", "selfie", "live", "panorama", "burst", "video"]);
   for (const s of day.stops || []) {
-    s.photo_urls = (s.photos || [])
+    // photo_items carries each url's time, so the wiki page can put a photo in the
+    // block of a split stop that it was taken in (splitOnMeetings).
+    s.photo_items = (s.photos || [])
       .map(p => urlByUuid[p.uuid]).filter(r => r && DISPLAY.has(r.media_type))
       .sort((a, b) => (a.favorite ? 0 : 1) - (b.favorite ? 0 : 1) || String(a.taken_at).localeCompare(String(b.taken_at)))
-      .map(r => r.thumb_url);
+      .map(r => ({ url: r.thumb_url, taken_at: r.taken_at }));
+    s.photo_urls = s.photo_items.map(it => it.url);
   }
 
   const htmlPath = path.join(TMP, `daily-summary-${date}.html`);
