@@ -191,3 +191,33 @@ test("a call falls into the block its time is in", () => {
   assert.ok(after.indexOf("Call with Sam") > 0 && after.indexOf("Call with Sam") < after.indexOf("Bistro Example"), html);
   assert.ok(html.indexOf("Call with Sam") > html.indexOf("Plumber"));
 });
+
+// A meeting whose record has no end of its own is laid out to the calendar's end time. That
+// plan end is not a boundary the user crossed: a short stretch after it is the meeting running
+// over, so it does not open a separate block at the planned end (2026-11-27: a game planned
+// 7:30 to 10pm, the stay ending 10:12pm, drew a second "10:00pm" block).
+test("a meeting record with no end of its own keeps a short stretch after the plan's end", () => {
+  const record = (over = {}) => ({ summary: "Family game", calendar: { start: iso("19:30"), end: iso("22:00"), location: null },
+    happened: { value: "yes" }, where: { mode: "in_person", place: "Home", stop_id: "s-1" }, start: null, end: null,
+    participants: { names: ["Pat"] }, what: { text: "You played." }, ...over });
+  const build = (until, rec) => {
+    const home = stop("s-1", "19:13", until, "Home", { address: "12 Palm Way, Springfield" });
+    return { date: "2026-11-25", tz: TZ, tzs: [TZ], stops: [home], travel_legs: [], unmatched_calendar_events: [],
+      calendar_busy: [], meeting_records: { status: "ok", records: [rec] } };
+  };
+  const windows = (d) => splitOnMeetings(d, d.stops).stops.map(s => `${s.start}-${s.end}${s._meeting ? " meeting" : ""}`);
+  // 12 minutes after the plan's end: the meeting holds them, no 22:00 block
+  assert.deepEqual(windows(build("22:12", record())), ["19:13-19:30", "19:30-22:12 meeting"]);
+  // an hour after it: the user was plainly somewhere else in the stop, so it is its own block
+  assert.deepEqual(windows(build("23:00", record())), ["19:13-19:30", "19:30-22:00 meeting", "22:00-23:00"]);
+  // a record that has an end of its own keeps the plain rule: 12 minutes is a block
+  assert.deepEqual(windows(build("22:12", record({ start: iso("19:30"), end: iso("22:00") }))), ["19:13-19:30", "19:30-22:00 meeting", "22:00-22:12"]);
+  // JORI_CAL_OPEN_END_TAIL_MIN=0 restores the plain rule for a plan-only end
+  process.env.JORI_CAL_OPEN_END_TAIL_MIN = "0";
+  try {
+    // module constant is read at load: the flag is checked with a fresh load
+    const fresh = (() => { const p = require.resolve(path.join(ROOT, "lib/daily-summary-render.js")); delete require.cache[p]; return require(p); })();
+    const d = build("22:12", record());
+    assert.deepEqual(fresh._internal.splitOnMeetings(d, d.stops).stops.map(s => `${s.start}-${s.end}${s._meeting ? " meeting" : ""}`), ["19:13-19:30", "19:30-22:00 meeting", "22:00-22:12"]);
+  } finally { delete process.env.JORI_CAL_OPEN_END_TAIL_MIN; delete require.cache[require.resolve(path.join(ROOT, "lib/daily-summary-render.js"))]; }
+});
