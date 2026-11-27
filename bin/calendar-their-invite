@@ -3,7 +3,7 @@
 // Jori already sent an invitation for, take Jori's off and keep theirs.
 //
 // The user's rule (2026-11-27): "if someone already sent me an invite (like in
-// the case of sierra for the same time we wanted to invite them) - there's no
+// the case of [a contractor] for the same time we wanted to invite them) - there's no
 // need to send our own invite. we should just use theirs."
 //
 // bin/jori-calendar refuses to send our invite when theirs is already on the

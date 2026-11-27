@@ -49,21 +49,21 @@ const SLOT = ["--from", "2026-12-10T11:00:00-05:00", "--to", "2026-12-10T12:00:0
 const AUTH = ["--attendee-authorized", "invite them to tour the apartments in person"];
 const THEIRS = {
   id: "THEIRS", summary: "onsite with the owner", status: "confirmed",
-  organizer: { email: "sierra@builder.test", displayName: "Sierra S" },
-  attendees: [{ email: "sierra@builder.test", organizer: true }, { email: OWNER, self: true, responseStatus: "accepted" }, { email: "zak@builder.test" }],
+  organizer: { email: "pat@builder.test", displayName: "Pat P" },
+  attendees: [{ email: "pat@builder.test", organizer: true }, { email: OWNER, self: true, responseStatus: "accepted" }, { email: "lee@builder.test" }],
   start: { dateTime: "2026-12-10T11:00:00-05:00", timeZone: "America/New_York" }, end: { dateTime: "2026-12-10T12:00:00-05:00" },
 };
 const OURS = {
   id: "OURS", summary: "Walkthrough", status: "confirmed",
   organizer: { email: OWNER, self: true },
-  attendees: [{ email: "zak@builder.test" }, { email: "sierra@builder.test" }],
+  attendees: [{ email: "lee@builder.test" }, { email: "pat@builder.test" }],
   extendedProperties: { private: { jori_created: "1" } },
   start: { dateTime: "2026-12-10T11:00:00-05:00" }, end: { dateTime: "2026-12-10T12:00:00-05:00" },
 };
 
 test("an invite to people who already sent one for this slot is refused (exit 10)", () => {
   const { code, err } = run(["create", "--calendar", "primary", "--summary", "Walkthrough", ...SLOT,
-    "--attendees", "zak@builder.test,sierra@builder.test", ...AUTH], { GOG_FAKE_EVENTS_FILE: fixture([THEIRS]) });
+    "--attendees", "lee@builder.test,pat@builder.test", ...AUTH], { GOG_FAKE_EVENTS_FILE: fixture([THEIRS]) });
   assert.equal(code, 10, err);
   assert.match(err, /already sent the user an invitation/);
   assert.match(err, /THEIRS/);
@@ -71,14 +71,14 @@ test("an invite to people who already sent one for this slot is refused (exit 10
 
 test("--overlap-ok does not wave it through", () => {
   const { code } = run(["create", "--calendar", "primary", "--summary", "Walkthrough", ...SLOT,
-    "--attendees", "zak@builder.test", ...AUTH, "--overlap-ok", "a second separate event"], { GOG_FAKE_EVENTS_FILE: fixture([THEIRS]) });
+    "--attendees", "lee@builder.test", ...AUTH, "--overlap-ok", "a second separate event"], { GOG_FAKE_EVENTS_FILE: fixture([THEIRS]) });
   assert.equal(code, 10);
 });
 
 test("--their-invite-ok with a reason is honored and logged", () => {
   const reason = "a second, separate meeting with the same company";
   const { code, err } = run(["create", "--calendar", "primary", "--summary", "Walkthrough", ...SLOT,
-    "--attendees", "zak@builder.test", ...AUTH, "--their-invite-ok", reason, "--overlap-ok", "separate meeting, see above"], { GOG_FAKE_EVENTS_FILE: fixture([THEIRS]) });
+    "--attendees", "lee@builder.test", ...AUTH, "--their-invite-ok", reason, "--overlap-ok", "separate meeting, see above"], { GOG_FAKE_EVENTS_FILE: fixture([THEIRS]) });
   assert.equal(code, 0, err);
   const rows = fs.readFileSync(LOG, "utf8").trim().split("\n").map((l) => JSON.parse(l));
   assert.equal(rows.at(-1).their_invite_override, reason);
@@ -91,7 +91,7 @@ test("an event with no guests is not affected (the overlap guard still speaks)",
 
 test("adding a guest on update checks too", () => {
   const mine = { ...OURS, attendees: [] };
-  const { code } = run(["update", "OURS", "--calendar", "primary", "--add-attendee", "zak@builder.test", ...AUTH],
+  const { code } = run(["update", "OURS", "--calendar", "primary", "--add-attendee", "lee@builder.test", ...AUTH],
     { GOG_FAKE_EVENTS_FILE: fixture([mine, THEIRS]) });
   assert.equal(code, 10);
 });
@@ -108,7 +108,7 @@ test("the sweep deletes ours with a cancellation to its guests and tells the use
   const del = calls.find((c) => c.bin === "jori-calendar");
   assert.deepEqual(del.argv, ["delete", "OURS", "--calendar", "primary", "--send-updates", "all"]);
   const sent = calls.find((c) => c.bin === "jori-send-curl");
-  assert.ok(sent && sent.argv.join(" ").includes("Sierra"));
+  assert.ok(sent && sent.argv.join(" ").includes("Pat"));
 });
 
 test("the sweep dry run writes nothing", () => {
