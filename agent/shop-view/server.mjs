@@ -8,10 +8,12 @@
 //   frames  Page.startScreencast on the selected tab while someone is watching
 //           (stops 20s after the last frame request); the page long-polls
 //           GET /api/frame?after=<seq> for the newest JPEG.
-//   input   POST /api/input {type: tap|scroll|text|key|navigate|back|forward|
+//   input   POST /api/input {type: tap|scroll|drag|text|key|navigate|back|forward|
 //           reload|tab|phone|done}. Taps are real mouse events
 //           (Input.dispatchMouseEvent), a swipe on the picture is mouse-wheel
-//           scrolling at the finger's spot, text is one keyDown/keyUp per
+//           scrolling at the finger's spot (Drag mode on the page sends the traced path
+//           as one real mouse drag: press, moves with the left button held,
+//           release), text is one keyDown/keyUp per
 //           character — the same trusted input shop-browser.mjs uses, because
 //           merchant bot sensors refuse synthetic JS clicks.
 //   hold    the tab, and the phone layout with it, is kept for HOLD_MS after
@@ -184,6 +186,27 @@ async function act(a, email) {
       const p = V.toViewport(a.x, a.y, S.meta);
       if (!p) throw new Error("no frame yet — wait for the picture");
       await s.send("Input.dispatchMouseEvent", { type: "mouseWheel", x: p.x, y: p.y, ...V.scrollDelta(a, S.meta) });
+      return;
+    }
+    case "drag": {
+      // A real drag (a "slide to verify" handle): press, moves with the left
+      // button held, release. Not a wheel scroll.
+      const path = V.dragPath(a.points, S.meta);
+      if (!path) throw new Error("no frame yet — wait for the picture");
+      const first = path[0], end = path[path.length - 1];
+      await s.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: first.x, y: first.y });
+      await s.send("Input.dispatchMouseEvent", { type: "mousePressed", x: first.x, y: first.y, button: "left", buttons: 1, clickCount: 1 });
+      try {
+        await B.sleep(80);
+        for (const p of path.slice(1)) {
+          await s.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y, button: "left", buttons: 1 });
+          await B.sleep(12);
+        }
+        await B.sleep(80);
+      } finally {
+        // Always let go, so a failed move never leaves the shop Chrome's button held down.
+        await s.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: end.x, y: end.y, button: "left", buttons: 0, clickCount: 1 }).catch(() => {});
+      }
       return;
     }
     case "text":

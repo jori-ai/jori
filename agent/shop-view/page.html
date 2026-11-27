@@ -18,10 +18,11 @@
   button { cursor:pointer; white-space:nowrap; touch-action:manipulation; }
   button:disabled { opacity:.4; }
   button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.on { background:var(--accent); border-color:var(--accent); color:#fff; }
   button.done { background:var(--ok); border-color:var(--ok); color:#fff; }
   #url { flex:1; min-width:0; }
   #tabs { flex:1; min-width:0; }
-  /* One finger on the picture is ours (swipe = scroll the shop page); two still pinch-zoom this page where supported. */
+  /* One finger on the picture is ours (swipe = scroll the shop page, or a drag in Drag mode); two still pinch-zoom this page where supported. */
   #screen { position:absolute; inset:0; margin:auto; max-width:100%; max-height:100%; touch-action:none; touch-action:pinch-zoom; user-select:none; -webkit-user-select:none; -webkit-touch-callout:none; -webkit-user-drag:none; }
   #wrap { position:relative; flex:1 1 0; min-height:160px; overflow:hidden; background:#888; }
   /* Two lines, always: a longer message must not resize the picture under phone view. */
@@ -37,10 +38,11 @@
   <button id="back" aria-label="Back">&#8249;</button>
   <input id="url" type="url" inputmode="url" autocapitalize="off" autocorrect="off" placeholder="Address">
   <button id="go">Go</button>
-  <div class="bar" style="padding:0;width:100%">
+  <div class="bar" style="padding:0;width:100%;flex-wrap:wrap">
     <select id="tabs" aria-label="Tab"></select>
     <button id="reload" aria-label="Reload">&#8635;</button>
     <button id="phone">Phone view</button>
+    <button id="drag" aria-pressed="false">Drag</button>
     <button id="zout" class="zoom" aria-label="Zoom out" hidden>&minus;</button><button id="zin" class="zoom" aria-label="Zoom in" hidden>+</button>
     <button id="done" class="done">Done</button>
   </div>
@@ -63,7 +65,10 @@ const ASSISTANT = document.documentElement.dataset.assistant || "Jori"; // contr
 const $ = (id) => document.getElementById(id);
 const img = $("screen"), status = $("status");
 let seq = 0, alive = true, looping = false, stale = false, phone = false, zoom = 1, lastUrl = null, noteUntil = 0;
-const LIVE = "Live — swipe the picture to scroll, tap it to click, type below.";
+const LIVE_SCROLL = "Live — swipe the picture to scroll, tap it to click, type below.";
+const LIVE_DRAG = "Drag mode — a finger on the picture drags (a slider handle, say). Tap Drag again to scroll.";
+let dragMode = false;
+const live = () => (dragMode ? LIVE_DRAG : LIVE_SCROLL);
 // Phone view's zoom steps: the shop page is laid out at (picture size / zoom),
 // so a smaller step fits more of a tall form on the screen at once.
 const ZOOMS = [1, 0.8, 0.65, 0.5];
@@ -112,7 +117,7 @@ async function frames() {
         img.onload = () => { if (lastUrl) URL.revokeObjectURL(lastUrl); lastUrl = url; };
         img.src = url;
         stale = false;
-        if (Date.now() > noteUntil) status.textContent = LIVE;
+        if (Date.now() > noteUntil) status.textContent = live();
       } else if (r.status !== 204) {
         status.textContent = "The shop browser isn't answering (" + r.status + "). Retrying…";
         await nap(3000);
@@ -165,14 +170,23 @@ img.addEventListener("pointerdown", (ev) => {
   if (ev.isPrimary) down.clear();
   down.add(ev.pointerId);
   try { img.setPointerCapture(ev.pointerId); } catch {}
-  if (down.size > 1) { g = null; return; }
+  if (down.size > 1) { g = null; $("dot").style.display = "none"; return; }
   if (ev.pointerType === "mouse" && ev.button !== 0) return;
   ev.preventDefault();
   const p = frac(ev);
-  g = { id: ev.pointerId, sx: ev.clientX, sy: ev.clientY, lx: ev.clientX, ly: ev.clientY, x: p.x, y: p.y, axis: null };
+  g = { id: ev.pointerId, sx: ev.clientX, sy: ev.clientY, lx: ev.clientX, ly: ev.clientY, x: p.x, y: p.y, axis: null, drag: dragMode, pts: [p] };
+  if (g.drag) showDot(p);
 });
 img.addEventListener("pointermove", (ev) => {
   if (!g || ev.pointerId !== g.id) return;
+  if (g.drag) {
+    // Drag mode: record the whole path; it goes as one real mouse drag on release.
+    const p = frac(ev);
+    const lastPt = g.pts[g.pts.length - 1];
+    if (Math.hypot(ev.clientX - g.lx, ev.clientY - g.ly) >= 2 && Math.hypot(p.x - lastPt.x, p.y - lastPt.y) > 0) { g.pts.push(p); g.lx = ev.clientX; g.ly = ev.clientY; g.moved = g.moved || Math.hypot(ev.clientX - g.sx, ev.clientY - g.sy) >= SLOP; }
+    showDot(p);
+    return;
+  }
   const ax = ev.clientX - g.sx, ay = ev.clientY - g.sy;
   if (!g.axis) {
     if (Math.hypot(ax, ay) < SLOP) return;
@@ -189,10 +203,15 @@ img.addEventListener("pointerup", (ev) => {
   if (!g || ev.pointerId !== g.id) return;
   const t = g; g = null;
   last = { x: t.x, y: t.y };
+  if (t.drag) {
+    $("dot").style.display = "none";
+    if (!t.moved) return tap(t);
+    return drag(t.pts, frac(ev));
+  }
   if (!t.axis) tap(t);
 });
-img.addEventListener("pointercancel", (ev) => { down.delete(ev.pointerId); g = null; });
-img.addEventListener("lostpointercapture", (ev) => { down.delete(ev.pointerId); if (g && ev.pointerId === g.id) g = null; });
+img.addEventListener("pointercancel", (ev) => { down.delete(ev.pointerId); g = null; $("dot").style.display = "none"; });
+img.addEventListener("lostpointercapture", (ev) => { down.delete(ev.pointerId); if (g && ev.pointerId === g.id) { g = null; $("dot").style.display = "none"; } });
 img.addEventListener("dragstart", (ev) => ev.preventDefault());
 img.addEventListener("wheel", (ev) => {
   ev.preventDefault();
@@ -204,6 +223,24 @@ img.addEventListener("wheel", (ev) => {
 // After Done, or back from another app, the picture may be old: a tap brings
 // the live view back and clicks nothing, so it never lands on what has moved.
 function revive() { alive = true; restale(); note("Picking the page back up… tap again once the picture is live."); refreshState(); frames(); }
+// A dot under the finger while dragging (the shop page only changes once the drag is sent).
+function showDot(p) {
+  const b = img.getBoundingClientRect(), w = $("wrap").getBoundingClientRect();
+  const d = $("dot"); d.style.left = (b.left - w.left + p.x * b.width) + "px"; d.style.top = (b.top - w.top + p.y * b.height) + "px"; d.style.display = "block";
+}
+// The traced path (thinned to the server's limit, ends kept) goes as one drag.
+function drag(pts, endPt) {
+  if (!alive) return revive();
+  if (stale) return note("Refreshing the picture… drag again in a moment.", 3000);
+  if (endPt) pts.push(endPt);
+  const MAX = 150;
+  const step = pts.length > MAX ? (pts.length - 1) / (MAX - 1) : 1;
+  const out = [];
+  for (let i = 0; i < pts.length && out.length < MAX; i = Math.round(out.length * step)) out.push(pts[i]);
+  if (out[out.length - 1] !== pts[pts.length - 1]) out[out.length - 1] = pts[pts.length - 1];
+  note("Dragging…", 2500);
+  post({ type: "drag", points: out.map((p) => ({ x: p.x, y: p.y })) }, 20000).catch(() => {});
+}
 function tap(t) {
   if (!alive) return revive();
   if (stale) return note("Refreshing the picture… tap again in a moment.", 3000);
@@ -235,6 +272,12 @@ function setView(on, z) {
     .then((s) => { renderState(s); note("Tip: pick the view before you start filling in a form. Some checkout pages start over when it changes."); })
     .catch(() => {});
 }
+$("drag").onclick = () => {
+  dragMode = !dragMode;
+  $("drag").classList.toggle("on", dragMode);
+  $("drag").setAttribute("aria-pressed", String(dragMode));
+  note(live(), 6000);
+};
 $("phone").onclick = () => setView(!phone, 1);
 $("zout").onclick = () => setView(true, ZOOMS.find((z) => z < zoom - 0.001) ?? ZOOMS[ZOOMS.length - 1]);
 $("zin").onclick = () => setView(true, [...ZOOMS].reverse().find((z) => z > zoom + 0.001) ?? 1);
