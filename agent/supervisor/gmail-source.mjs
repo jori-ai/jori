@@ -240,20 +240,6 @@ function intakeMeetingRequestP1(messageId) {
   return { stamped: true, applied };
 }
 
-// The user's rule (2026-11-27): when the other side sends an invitation for a
-// meeting Jori already sent one for, use theirs. A new invitation is the moment
-// that can happen, so intake starts the sweep (bin/calendar-their-invite: code
-// only, deletes only Jori-made duplicates). Detached and fail-open: it never
-// holds up intake, and the cron backstop catches what it misses.
-const THEIR_INVITE_BIN = installTools("bin/calendar-their-invite");
-function sweepTheirInvites() {
-  try {
-    const child = spawn(process.execPath, [THEIR_INVITE_BIN, "sweep", "--quiet"], { detached: true, stdio: "ignore" });
-    child.on("error", () => {});
-    child.unref();
-  } catch {}
-}
-
 // Optional per-instance intake step: agent/supervisor/_ext/gmail-intake.mjs
 // (absent in a plain install). It exports
 //   intake({ messageId, from, subject, gmailAction, ctx })
@@ -348,7 +334,6 @@ async function runIntakeCascade(messageId, fromHeader, subject, toJori = false) 
     return { skip: false, kind: "reply-to-me-p1", detail: `reply-to-me -> p1+star applied=${p1.applied}` };
   }
   const mr = intakeMeetingRequestP1(messageId);
-  if (mr.stamped) sweepTheirInvites();
   if (mr.stamped) return { skip: false, kind: "meeting-request-p1", detail: `meeting-request -> p1+star applied=${mr.applied}` };
   // Command channel (isAddressedToJori). Mail the user addressed TO Jori is an
   // instruction, and both filters below end in "label it and skip the dispatch",
@@ -1313,9 +1298,6 @@ export class GmailSource {
               if (mr.stamped) {
                 stampedP1 = true; stamp = mr; stamps.push("meeting-request-p1");
                 this.triageLog(`meeting-request-p1 ${m.messageId} from ${extractEmailAddr(m.from)} → p1+star applied=${mr.applied}`);
-                // Someone else's invitation: if Jori already sent one for the same
-                // meeting, theirs wins (bin/calendar-their-invite). Detached, fail-open.
-                sweepTheirInvites();
               }
             }
           }

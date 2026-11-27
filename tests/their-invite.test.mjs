@@ -5,7 +5,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { sameParty, findTheirInvites, findDuplicatePairs, isTheirInvite } from "../lib/their-invite.mjs";
+import { sameParty, findTheirInvites, isTheirInvite } from "../lib/their-invite.mjs";
 
 const OWNER = "owner@example.com";
 const owners = [OWNER];
@@ -59,23 +59,4 @@ test("someone else's invite, our own events, declined or cancelled ones are not 
   assert.equal(findTheirInvites([theirs({ status: "cancelled" })], q).length, 0);
   const declined = theirs({ attendees: [{ email: OWNER, self: true, responseStatus: "declined" }, { email: "lee@builder.test" }] });
   assert.ok(!isTheirInvite(declined, new Set(owners)));
-});
-
-test("the sweep pairs our invite with theirs for the same meeting", () => {
-  const pairs = findDuplicatePairs([ours(), theirs()], owners);
-  assert.equal(pairs.length, 1);
-  assert.equal(pairs[0].ours.id, "OURS");
-  assert.equal(pairs[0].theirs.id, "THEIRS");
-});
-
-test("the sweep never pairs an event the user made by hand, or one with no guests", () => {
-  const byHand = ours({ extendedProperties: undefined });
-  const noGuests = ours({ attendees: [] });
-  assert.equal(findDuplicatePairs([byHand, theirs()], owners).length, 0);
-  assert.equal(findDuplicatePairs([noGuests, theirs()], owners).length, 0);
-});
-
-test("the sweep needs the times to really overlap", () => {
-  const later = theirs({ start: { dateTime: "2026-12-10T12:00:00-05:00" }, end: { dateTime: "2026-12-10T13:00:00-05:00" } });
-  assert.equal(findDuplicatePairs([ours(), later], owners).length, 0);
 });
