@@ -44,6 +44,25 @@ test("the user is never a companion; tags read under one canonical name", () => 
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test("a face tag with stray spaces is the same person, in JS and in the Python twin", () => {
+  const dir = sandbox();
+  withEnv({ JORI_LOCAL_DIR: path.join(dir, "local"), JORI_HOME: path.join(dir, "home") }, () => {
+    assert.equal(C.canonicalName("Sam "), "Sam", "an unlisted tag is kept trimmed");
+    assert.equal(C.canonicalName(" Sam Example "), "Sam", "an alias matches the trimmed tag");
+    assert.equal(C.canonicalName(" Alex Example "), null, "the user stays out whatever the spacing");
+    assert.equal(C.canonicalName("   "), null, "a blank tag is nobody");
+    // one entry per person: "Sam " and "Sam" are one companion
+    assert.deepEqual(C.canonicalCompanions(["Sam ", "Sam", "Sam Example", { name: "Rover Example ", n: 1 }]),
+      ["Sam", { name: "Rover", n: 1 }]);
+  });
+  const r = spawnSync("python3", ["-c",
+    "import json,companions as c; print(json.dumps([c.canonical_name('Sam '), c.canonical_name(' Sam Example '), c.canonical_name(' Alex Example '), c.canonical_name('  ')]))"],
+    { cwd: LIB, encoding: "utf8", env: { ...process.env, JORI_LOCAL_DIR: path.join(dir, "local"), JORI_HOME: path.join(dir, "home") } });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(JSON.parse(r.stdout), ["Sam", "Sam", null, null]);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test("a fresh install: no aliases, nobody known, only the owner is self", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "companions-empty-"));
   withEnv({ JORI_LOCAL_DIR: dir, JORI_HOME: dir }, () => {

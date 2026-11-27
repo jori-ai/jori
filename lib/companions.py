@@ -33,9 +33,12 @@ def companion_names():
 def canonical_name(name, names=None):
     """The canonical companion name for a tag, or None for the user themself."""
     names = names or companion_names()
-    if not name or name in names["self"]:
+    # A face tag can carry stray spaces ("Sam "): the person is the same, so the
+    # tag is matched, and kept, trimmed.
+    tag = name.strip() if isinstance(name, str) else name
+    if not tag or tag in names["self"]:
         return None
-    return names["aliases"].get(name, name)
+    return names["aliases"].get(tag, tag)
 
 
 def known_companions_file():
