@@ -30,7 +30,6 @@
       "meeting-calendar-check",
       "call-log",
       "calendar-attendee-audit",
-      "calendar-their-invite",
       "purchase",
       "purchase-*",
       "receipt-scan"

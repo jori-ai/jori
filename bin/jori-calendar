@@ -93,8 +93,10 @@
 // three hours, and refuses (exit 10) when an event organized by one of the
 // invitees, or by a colleague at their company's domain, is already there
 // (lib/their-invite.mjs). `--overlap-ok` does not pass it; only
-// `--their-invite-ok "<why this is a separate meeting>"` does. When theirs
-// arrives after ours (the race above), bin/calendar-their-invite takes ours off.
+// `--their-invite-ok "<why this is a separate meeting>"` does. Refined the
+// same day: "if their invite comes first use theirs, but if they haven't sent
+// one by the time we're about to send ours - send ours instead." So the check
+// is at send time only; theirs arriving later changes nothing.
 //
 // WHAT THIS DOES NOT CLOSE. Bash is open to every agent, so a determined turn
 // can call `gog calendar` directly. Three further layers cover that: the MCP
@@ -374,8 +376,8 @@ if (attendees.length && authorization.trim().length < MIN_AUTHORIZATION_CHARS) {
 // an authorized invite gets this far) and before the overlap guard, so
 // `--overlap-ok` cannot wave it through and the refusal names the real fix.
 // Fails open on a read error, like the overlap guard: refusing every invite
-// because one read hiccuped would block the user's own ask, and the
-// calendar-their-invite sweep still takes a duplicate off afterwards.
+// because one read hiccuped would block the user's own ask (their rule: when
+// theirs is not there, send ours).
 if (attendees.length && (cmd === "create" || cmd === "update")) {
   let from = peekFlag("--from");
   let to = peekFlag("--to");
