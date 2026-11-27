@@ -473,6 +473,8 @@ Always fix via the prose JSON + re-`assemble`; **never hand-edit the HTML.** Che
 
 ## Step 4.6 — An independent Opus review reads the report, repairs it, and reads it again (max 3 rounds)
 
+The reviewer's fact sheet lists the step counter's walks inside a stop (iPhone and Watch readings, not GPS): each is the support for one "Walk H:MM to H:MMpm" line the report prints under a stop, so a walk during a meeting at one place is not "impossible" (`JORI_REVIEW_STEP_WALKS=0` leaves them out).
+
 **Nothing is published until another model has read it against the facts it was built from.** the user, 2026-07-30: *"maybe we should add a loop to review and improve the report until it's ready to publish ... catch duplicates, missing info, etc."* the user, 2026-10-15, after the Oct 14 summary opened "7:00am · Café Antilia" with the Watch having the user asleep until 7:29: *"before sending we should have another LLM review (opus level) to catch any issues or inconsistencies and repair them before sending."*
 
 ```bash

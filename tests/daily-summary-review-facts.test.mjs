@@ -327,3 +327,22 @@ test("a one-stop day's movement totals say the walked figure is a floor beside a
   assert.match(text, /walked 0\.2 miles/, text);
   assert.match(text, /step-only walk lines under a stop[^\n]*the figure is a floor/, text);
 });
+
+// A step-counter walk inside a stop is code's measurement, and the report prints it as a line
+// under that stop. The fact sheet did not list the readings, so the reviewer judged such a line
+// in the middle of a meeting impossible against a trace that shows one place.
+test("the fact sheet lists the step counter's walks inside a stop as the support for the walk lines", () => {
+  const T0 = Date.parse("2026-03-02T00:00:00Z"), at = (h, m = 0) => T0 + (h * 60 + m) * 60000;
+  const stop = { id: "home", start: "19:00", end: "23:00", start_ts_ms: at(19), end_ts_ms: at(23), duration_min: 240, place: { name: "Home", source: "named_location" } };
+  const day = { date: "2026-03-02", tz: "UTC", stops: [stop], path: { tz: "UTC", stats: {}, spine: [] },
+    steps: { total: 900, walks: [
+      { kind: "in_stop", stop_id: "home", leg_id: null, start_ms: at(20, 58), end_ms: at(21, 8), mins: 10, steps: 500 },
+      { kind: "between", stop_id: null, leg_id: null, start_ms: at(18, 57), end_ms: at(19, 20), mins: 23, steps: 1344 } ] } };
+  const pack = (steps) => R.factPack({ date: "2026-03-02", manifest: { stops: [{ id: "home", title: "Home", companions: [] }] }, day: { ...day, steps }, statements: {}, corrections: [] });
+  const text = pack(day.steps);
+  assert.match(text, /STEP-COUNTER WALKS INSIDE A STOP \(code[^\n]*not GPS[^\n]*\): 8:58pm to 9:08pm, 10 min, 500 steps\./, text);
+  assert.doesNotMatch(text, /6:57pm|7:20pm|1344/, "a walk between stops is a leg's business, not listed here");
+  assert.doesNotMatch(pack({ total: 900, walks: [] }), /STEP-COUNTER WALKS/);
+  process.env.JORI_REVIEW_STEP_WALKS = "0";
+  try { assert.doesNotMatch(pack(day.steps), /STEP-COUNTER WALKS/); } finally { delete process.env.JORI_REVIEW_STEP_WALKS; }
+});
