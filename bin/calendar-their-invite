@@ -1,0 +1,122 @@
+#!/usr/bin/env node
+// calendar-their-invite — when the other side's invitation arrives for a meeting
+// Jori already sent an invitation for, take Jori's off and keep theirs.
+//
+// The user's rule (2026-11-27): "if someone already sent me an invite (like in
+// the case of sierra for the same time we wanted to invite them) - there's no
+// need to send our own invite. we should just use theirs."
+//
+// bin/jori-calendar refuses to send our invite when theirs is already on the
+// calendar. This covers the other order: ours went out first and theirs came a
+// few minutes later (what actually happened: the contractor's coordinator wrote
+// "I will send a google calendar invite out here shortly", and Jori's own invite
+// beat hers by two minutes). Two invitations for one meeting then sit in the
+// guests' calendars, so ours is deleted WITH a cancellation to its guests
+// (`--send-updates all`): without it their calendars keep a ghost copy.
+//
+// Which events are the same meeting is code (agent/CLAUDE.md § Rule #0b; see
+// lib/their-invite.mjs): Jori's event carries the jori_created stamp and has
+// guests; theirs is organized by one of those guests or a colleague at the same
+// company domain, and the two overlap in time. Only events Jori made are ever
+// deleted; an event the user made by hand is never touched.
+//
+//   calendar-their-invite sweep [--days 120] [--dry-run] [--quiet] [--json]
+//       find the pairs from now through N days; delete ours, tell the user once
+//       per pair (jori-send-curl), log to data/logs/calendar-their-invite.jsonl.
+//       --dry-run prints what it would do and writes nothing.
+//
+// Runs from email intake when an invitation arrives (agent/supervisor/
+// gmail-source.mjs, detached) and from cron as a backstop (system/tasks.json).
+// Exit 0 always on a finished sweep (with or without pairs); 1 when the
+// calendar could not be read.
+
+import fs from "node:fs";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+import { findDuplicatePairs, describeEvent } from "../lib/their-invite.mjs";
+
+const require = createRequire(import.meta.url);
+const { instance, localConfig } = require("../lib/instance.cjs");
+const { installRoot, installTools } = require("../lib/root.cjs");
+
+const GOG = process.env.JORI_CALENDAR_GOG_BIN || process.env.GOG_BIN
+  || ["/opt/homebrew/bin/gog", "/usr/local/bin/gog"].find((p) => fs.existsSync(p)) || "gog";
+const JORI_CALENDAR = process.env.JORI_THEIR_INVITE_CALENDAR_BIN || path.join(path.dirname(new URL(import.meta.url).pathname), "jori-calendar");
+const SEND = process.env.JORI_THEIR_INVITE_SEND_BIN || installTools("bin/jori-send-curl");
+const LOG = process.env.JORI_THEIR_INVITE_LOG || path.join(installRoot(), "data/logs/calendar-their-invite.jsonl");
+const ACCOUNT = instance().owner_email;
+const ACCOUNT_ARGS = ACCOUNT ? ["--account", ACCOUNT] : [];
+const CAL = localConfig("calendar", { self_addresses: [] });
+const OWNERS = [ACCOUNT, ...(CAL.self_addresses || [])].filter(Boolean).map((a) => String(a).toLowerCase());
+
+const argv = process.argv.slice(2);
+const cmd = argv.shift();
+const has = (f) => argv.includes(f);
+const val = (f, d) => { const i = argv.indexOf(f); return i >= 0 && argv[i + 1] ? argv[i + 1] : d; };
+const DRY = has("--dry-run");
+const QUIET = has("--quiet");
+const JSON_OUT = has("--json");
+const DAYS = Math.max(1, Math.min(400, Number(val("--days", 120)) || 120));
+
+const say = (s) => { if (!QUIET) console.log(s); };
+
+if (cmd !== "sweep") {
+  console.error("Usage: calendar-their-invite sweep [--days 120] [--dry-run] [--quiet] [--json]");
+  process.exit(2);
+}
+
+function upcoming() {
+  const from = new Date(Date.now() - 3600e3).toISOString();
+  const to = new Date(Date.now() + DAYS * 86400e3).toISOString();
+  const r = spawnSync(GOG, ["calendar", "events", "primary", ...ACCOUNT_ARGS, "--no-input", "-j",
+    "--from", from, "--to", to, "--max", "2500"], { encoding: "utf8", timeout: 60_000, maxBuffer: 32 * 1024 * 1024 });
+  if (r.status !== 0 || !r.stdout) return null;
+  try { const j = JSON.parse(r.stdout); return j.items || j.events || (Array.isArray(j) ? j : []); } catch { return null; }
+}
+
+function localWhen(e) {
+  const t = e.start && (e.start.dateTime || e.start.date);
+  const tz = (e.start && e.start.timeZone) || instance().tz || undefined;
+  const d = new Date(t);
+  if (!Number.isFinite(d.getTime())) return String(t || "");
+  try {
+    return d.toLocaleString("en-US", { timeZone: tz, weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  } catch { return d.toISOString(); }
+}
+
+function firstName(email, e) {
+  const all = [e.organizer, ...(e.attendees || [])].filter(Boolean);
+  const p = all.find((x) => String(x.email || "").toLowerCase() === email);
+  const name = String((p && p.displayName) || "").trim();
+  if (name) return name.split(" ")[0];
+  const local = email.split("@")[0];
+  return local.charAt(0).toUpperCase() + local.slice(1);
+}
+
+const events = upcoming();
+if (!events) { console.error("calendar-their-invite: could not read the calendar"); process.exit(1); }
+const pairs = findDuplicatePairs(events, OWNERS);
+const results = [];
+for (const p of pairs) {
+  const row = { ts: new Date().toISOString(), ours: p.ours.id, ours_summary: p.ours.summary || null, theirs: p.theirs.id,
+    theirs_summary: p.theirs.summary || null, organizer: p.theirs.organizer && p.theirs.organizer.email, who: p.who, dry_run: DRY };
+  say(`${DRY ? "would remove" : "removing"} ours ${describeEvent(p.ours)}`);
+  say(`  keeping theirs ${describeEvent(p.theirs)}`);
+  if (!DRY) {
+    const r = spawnSync(JORI_CALENDAR, ["delete", p.ours.id, "--calendar", "primary", "--send-updates", "all"], { encoding: "utf8", timeout: 60_000 });
+    row.deleted = r.status === 0;
+    if (!row.deleted) row.error = String(r.stderr || r.stdout || "").trim().slice(-300);
+    if (row.deleted) {
+      const org = String(p.theirs.organizer.email || "").toLowerCase();
+      const text = `${firstName(org, p.theirs)} sent you an invitation for ${localWhen(p.theirs)} ("${p.theirs.summary || "the meeting"}"), so I took the one I had sent off your calendar and theirs. Theirs is the one to use now.`;
+      const s = spawnSync(SEND, ["--intent", "calendar-their-invite", text], { encoding: "utf8", timeout: 60_000 });
+      row.told_user = s.status === 0;
+    }
+    try { fs.mkdirSync(path.dirname(LOG), { recursive: true }); fs.appendFileSync(LOG, JSON.stringify(row) + "\n"); } catch {}
+  }
+  results.push(row);
+}
+if (JSON_OUT) console.log(JSON.stringify({ pairs: results }, null, 2));
+else if (!pairs.length) say("no duplicate invitations");
+process.exit(0);

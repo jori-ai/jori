@@ -1,0 +1,19 @@
+{
+  "name": "calendar-their-invite",
+  "title": "Use their invite, not ours",
+  "description": "When someone sends you a calendar invitation for a meeting Jori already sent one for, Jori takes its own off so everyone keeps just theirs, and tells you it did.",
+  "version": "1.0.0",
+  "default": "enabled",
+  "requires": { "plugins": [], "bins": ["bin/calendar-their-invite", "bin/jori-calendar", "bin/jori-send-curl"], "commands": [], "env": [] },
+  "schedules": [
+    {
+      "label": "calendar-their-invite",
+      "cron": "*/10 * * * *",
+      "command": "{sysnode} {root}/bin/calendar-their-invite sweep --quiet >> {root}/data/logs/calendar-their-invite.log 2>&1"
+    }
+  ],
+  "files": [
+    "bin/calendar-their-invite",
+    "lib/their-invite.mjs"
+  ]
+}

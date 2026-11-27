@@ -82,6 +82,20 @@
 // The calendar lane (agent/scripts/hum-harvesters/calendar.mjs) never counts
 // down to an unverified departure; it says to check the timetable instead.
 //
+// WHY AN INVITE CHECKS FOR THEIRS FIRST (2026-11-27). The user proposed a site
+// visit to a contractor by email; their coordinator answered that the time
+// worked and that she would send a calendar invite. Jori created its own event
+// and invited her and her colleague anyway, and her invite for the same hour
+// arrived two minutes later: two invitations for one meeting in three inboxes.
+// The user's rule: "if someone already sent me an invite ... there's no need
+// to send our own invite. we should just use theirs." So an invite (create
+// with --attendees, or update adding guests) first reads the slot, give or take
+// three hours, and refuses (exit 10) when an event organized by one of the
+// invitees, or by a colleague at their company's domain, is already there
+// (lib/their-invite.mjs). `--overlap-ok` does not pass it; only
+// `--their-invite-ok "<why this is a separate meeting>"` does. When theirs
+// arrives after ours (the race above), bin/calendar-their-invite takes ours off.
+//
 // WHAT THIS DOES NOT CLOSE. Bash is open to every agent, so a determined turn
 // can call `gog calendar` directly. Three further layers cover that: the MCP
 // write tools are removed from every agent's grant (agent/config/
@@ -102,6 +116,8 @@
 //   …and for any booking with a confirmation number (create or update):
 //     --booking-ref <confirmation number>   create refuses if an event already carries it; stamps it
 //     --booking-dup-ok "<why>"               only when one booking really needs two separate events
+//   …and, only when the invitees already sent an invite for this slot and this really is another meeting:
+//     --their-invite-ok "<why this is a separate meeting>"
 //   …and on update of an event the user made (see below):
 //     --from-confirmation <gmail messageId>   the booking's confirmation email licenses changing time/name/details
 //     --jori-event <job>                   this id came from <job>'s own earlier create
@@ -117,6 +133,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
+import { findTheirInvites, describeEvent } from "../lib/their-invite.mjs";
 
 const require = createRequire(import.meta.url);
 const { instance, localConfig, localDir } = require("../lib/instance.cjs");
@@ -238,6 +255,10 @@ const fromConfirmation = flag("--from-confirmation") || "";
 const joriEventClaim = flag("--jori-event") || "";
 const bookingRefRaw = flag("--booking-ref") || "";
 const bookingDupOk = flag("--booking-dup-ok") || "";
+const theirInviteOk = flag("--their-invite-ok") || "";
+// How far apart in time the other side's invite may sit and still be the same
+// meeting (they may have picked 10:30 for an 11:00 we proposed).
+const THEIR_INVITE_SLACK_MS = 3 * 3600e3;
 
 // A provider's confirmation number, as printed ("#40017733", "ABC-123").
 // lang-regex-ok: the shape of a machine identifier, never anything a person wrote.
@@ -346,6 +367,60 @@ if (attendees.length && authorization.trim().length < MIN_AUTHORIZATION_CHARS) {
     "",
     "See agent/CLAUDE.md § Calendar Invitations.",
   ], 4);
+}
+
+// ── Their invite is already here (create, or update that adds guests) ───────
+// See the their-invite note in the header. Runs after the attendee guard (only
+// an authorized invite gets this far) and before the overlap guard, so
+// `--overlap-ok` cannot wave it through and the refusal names the real fix.
+// Fails open on a read error, like the overlap guard: refusing every invite
+// because one read hiccuped would block the user's own ask, and the
+// calendar-their-invite sweep still takes a duplicate off afterwards.
+if (attendees.length && (cmd === "create" || cmd === "update")) {
+  let from = peekFlag("--from");
+  let to = peekFlag("--to");
+  let invitees = attendees;
+  if (cmd === "update") {
+    const probe = spawnSync(GOG, ["calendar", "event", calendar, eventId, ...ACCOUNT_ARGS, "--no-input", "-j"], { encoding: "utf8" });
+    let ev = null;
+    if (probe.status === 0 && probe.stdout) { try { const j = JSON.parse(probe.stdout); ev = j.event || j; } catch {} }
+    if (ev) {
+      from = from || ev.start?.dateTime || ev.start?.date;
+      to = to || ev.end?.dateTime || ev.end?.date;
+      const already = new Set((ev.attendees || []).map((a) => String(a.email || "").toLowerCase()));
+      invitees = attendees.filter((a) => !already.has(a));
+    }
+  }
+  if (from && to && invitees.length) {
+    const pad = (t, d) => { const v = Date.parse(t); return Number.isFinite(v) ? new Date(v + d).toISOString() : t; };
+    const probe = spawnSync(GOG, [
+      "calendar", "events", calendar, ...ACCOUNT_ARGS, "--no-input", "-j",
+      "--from", pad(from, -THEIR_INVITE_SLACK_MS), "--to", pad(to, THEIR_INVITE_SLACK_MS),
+    ], { encoding: "utf8" });
+    let items = [];
+    if (probe.status === 0 && probe.stdout) { try { items = JSON.parse(probe.stdout).items || []; } catch { items = []; } }
+    const found = findTheirInvites(items, { invitees, from, to, owners: SELF, slackMs: THEIR_INVITE_SLACK_MS });
+    if (found.length && theirInviteOk.trim().length < MIN_OVERLAP_OK_CHARS) {
+      die([
+        `REFUSED: ${[...new Set(found.flatMap((f) => f.who))].join(", ")} already sent the user an invitation for this meeting:`,
+        "",
+        ...found.map((f) => `  · ${describeEvent(f.event)}`),
+        "",
+        "The user's rule (2026-11-27): when the other side already sent an invite,",
+        "do not send ours. Use theirs:",
+        "  · send nothing; their invitation is the meeting",
+        "  · if the time or place differs from what was agreed, tell the user instead",
+        "    of sending a competing invite",
+        "  · notes, links or a Zoom/Meet line for the user go in your reply to the user",
+        "    (their event's description is theirs to edit, not ours)",
+        "",
+        "Only if this genuinely is a different meeting with the same people, say why:",
+        '  --their-invite-ok "<why this is a separate meeting>"',
+        "",
+        "See agent/CLAUDE.md § Calendar Invitations.",
+      ], 10);
+    }
+  }
 }
 
 // ── The booking-reference guard (create only) ───────────────────────────────
@@ -696,6 +771,7 @@ try {
     jori_event_claim: joriEventClaim || null,
     booking_ref: bookingRef || null,
     booking_dup_override: bookingDupOk || null,
+    their_invite_override: theirInviteOk || null,
     // A departure: whether its time was verified and where it came from
     // (null = not a departure, or not known to be one).
     transit_verified: transitVerified,
