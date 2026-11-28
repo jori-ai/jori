@@ -70,6 +70,11 @@ const LONGPOLL_MS = 12_000;
 const DONE_FILE = path.join(ROOT, "data/purchases/shop-view-done.json");
 const LOG = path.join(ROOT, "agent/logs/shop-view.log");
 const PAGE = path.join(HERE, "page.html");
+// Read once, at start, like the code that answers the page's requests: a page
+// read per request ran ahead of this process after a change landed (a new button
+// posting an action the running code did not know). stale-code-watch restarts
+// this daemon when page.html or its code changes, so the two always arrive together.
+const PAGE_HTML = fs.readFileSync(PAGE, "utf8");
 // Phone layout: a mobile viewport the size of the picture on the user's phone
 // (V.phoneMetrics), so a desktop form is readable there. Emulation overrides
 // belong to OUR CDP session and vanish when it closes, so the shop tab can
@@ -370,7 +375,7 @@ async function handle(req, res, listener) {
   if (req.method === "GET" && url.pathname === "/") {
     // The page names the assistant by its configured name (lib/instance.cjs).
     const name = assistantName().replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[ch]);
-    const page = fs.readFileSync(PAGE, "utf8").replace('<html lang="en">', `<html lang="en" data-assistant="${name}">`);
+    const page = PAGE_HTML.replace('<html lang="en">', `<html lang="en" data-assistant="${name}">`);
     return send(res, 200, page, {
       "Content-Type": "text/html; charset=utf-8",
       "Content-Security-Policy": "default-src 'self'; img-src 'self' blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",

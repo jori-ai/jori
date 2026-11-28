@@ -28,6 +28,8 @@ const FILES = {
   "bin/minibeat": "#!/bin/bash\nwhile true; do sleep 30; done\n",
   "agent/dashboard/server.mjs": 'import "./lib.mjs";\n',
   "agent/dashboard/lib.mjs": "export {};\n",
+  "agent/shop-view/server.mjs": "export {};\n",
+  "agent/shop-view/page.html": "<!doctype html><html lang=\"en\"><body>not javascript {</body></html>\n",
   "bin/wiki": 'require("../lib/wiki-serve.js");\n',
   "lib/wiki-serve.js": "module.exports = {};\n",
   "agent/whatsapp-channel/index.mjs": "export {};\n",
@@ -50,6 +52,7 @@ function harness(o = {}) {
     797: ["/bin/bash", path.join(ROOT, "heartbeat-sender.sh")],
     815: ["/bin/bash", path.join(ROOT, "bin/minibeat")],
     47267: ["/opt/homebrew/bin/node", path.join(ROOT, "agent/dashboard/server.mjs")],
+    31337: ["/opt/homebrew/bin/node", path.join(ROOT, "agent/shop-view/server.mjs")],
     24132: ["/opt/homebrew/bin/node", path.join(ROOT, "bin/wiki"), "serve", "--port", "9096"],
     24133: ["/opt/homebrew/bin/node", path.join(ROOT, "bin/wiki"), "serve", "--port", "9097"],
     24134: ["/opt/homebrew/bin/node", path.join(ROOT, "agent/whatsapp-channel/index.mjs")],
@@ -66,7 +69,7 @@ function harness(o = {}) {
     pmHealth: async () => (o.pmDown ? null : { children: [
       { name: "wiki-server", pid: 24132, alive: true }, { name: "wiki-server-public", pid: 24133, alive: true },
       { name: "whatsapp-channel", pid: 24134, alive: !o.waDown }] }),
-    launchdPid: (label) => ({ [m.SMALL[0].label]: 797, "com.jori.minibeat": 815, "com.jori.dashboard": 47267, "ai.claude.session": 24125 })[label] ?? null,
+    launchdPid: (label) => ({ [m.SMALL[0].label]: 797, "com.jori.minibeat": 815, "com.jori.dashboard": 47267, "com.jori.shop-view": 31337, "ai.claude.session": 24125 })[label] ?? null,
     git: (args) => {
       if (args[0] === "status") return (o.dirty || []).map((p) => ` M ${p}`).join("\0");
       return "";
@@ -108,6 +111,64 @@ test("a committed change to a small daemon restarts exactly it, by its own mecha
   await m.main([], h2.io, ROOT);
   assert.deepEqual(h2.calls, []);
   touch("bin/minibeat", OLD); touch("lib/wiki-serve.js", OLD);
+});
+
+// Regression guard for a page that runs ahead of the server code that answers
+// it (the shop browser served a new page the instant it was committed while the
+// running process still had the old action parser, so a new button answered
+// "unknown action"). The daemon's page is an `extra` file of its registry entry:
+// it counts as its code, so the daemon restarts when only the page changes.
+test("shop-view is a small daemon whose page counts as its code: a committed page change alone restarts it", async () => {
+  const t = m.SMALL.find((x) => x.name === "shop-view");
+  assert.ok(t, "shop-view is in SMALL");
+  assert.equal(t.kind, "launchd");
+  assert.equal(t.label, "com.jori.shop-view");
+  assert.equal(t.entry, "agent/shop-view/server.mjs");
+  assert.deepEqual(t.extra, ["agent/shop-view/page.html"]);
+
+  const PAGE = "agent/shop-view/page.html";
+  try {
+    touch(PAGE, NOW - 30 * MIN);                    // only the page changed, server.mjs is old
+    const h = harness();
+    assert.equal(await m.main([], h.io, ROOT), 0);
+    assert.deepEqual(h.calls, [["kickstart", "com.jori.shop-view"]]);
+    assert.ok(h.state()["shop-view"].stampMs);
+    // the same stamp is not restarted twice
+    const h2 = harness({ state: h.state(), now: NOW + 2 * MIN });
+    await m.main([], h2.io, ROOT);
+    assert.deepEqual(h2.calls, []);
+
+    // an uncommitted edit to the page holds it like an uncommitted edit to its code
+    const hd = harness({ dirty: [PAGE] });
+    await m.main([], hd.io, ROOT);
+    assert.deepEqual(hd.calls, []);
+
+    // a page that is gone is not an error: nothing to stamp, nothing thrown
+    const gone = path.join(ROOT, PAGE), parked = `${gone}.parked`;
+    fs.renameSync(gone, parked);
+    try {
+      const hg = harness();
+      assert.equal(await m.main([], hg.io, ROOT), 0);
+      assert.deepEqual(hg.calls, []);
+    } finally { fs.renameSync(parked, gone); }
+  } finally { touch(PAGE, OLD); }
+});
+
+test("syntaxOk checks scripts only: a page in a closure never reaches node --check", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "scw-syntax-"));
+  try {
+    const html = path.join(dir, "page.html");
+    const good = path.join(dir, "good.mjs");
+    const bad = path.join(dir, "bad.mjs");
+    fs.writeFileSync(html, "<!doctype html><html><body>function ( {{ not javascript</body></html>\n");
+    fs.writeFileSync(good, "export const ok = 1;\n");
+    fs.writeFileSync(bad, "export const = ;\n");
+    const { syntaxOk } = m.realIo();
+    assert.equal(syntaxOk([html]), true);
+    assert.equal(syntaxOk([good, html]), true);
+    assert.equal(syntaxOk([bad]), false);
+    assert.equal(syntaxOk([html, bad]), false);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("holds: uncommitted edit, failing syntax, code still settling, git busy", async () => {

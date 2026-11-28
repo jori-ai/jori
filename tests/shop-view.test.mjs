@@ -12,6 +12,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
@@ -324,4 +325,14 @@ test("appSigninLink: the app address when configured, null otherwise", () => {
   assert.equal(V.appSigninLink({ base: "http://mini:9088", site: "hertz.com" }), "http://mini:9088/?open=https%3A%2F%2Fhertz.com%2F&site=hertz.com");
   assert.equal(V.appSigninLink({ site: "x.com" }, { SHOP_VIEW_APP_URL: "http://m:1/" }), "http://m:1/?open=https%3A%2F%2Fx.com%2F&site=x.com");
   if (!V.DEFAULT_APP_URL) assert.equal(V.appSigninLink({ site: "x.com" }, {}), null);
+});
+
+// Regression guard for a page that runs ahead of the server code that answers it:
+// reading page.html per request served a new button the instant it landed, while
+// the running process still had the old action parser ("unknown action drag").
+test("server: page.html is read once at start, never inside a request handler", () => {
+  const src = fs.readFileSync(path.join(REPO, "agent/shop-view/server.mjs"), "utf8");
+  const reads = src.split("readFileSync(PAGE").length - 1;
+  assert.equal(reads, 1, "page.html is read in exactly one place");
+  assert.ok(src.indexOf("readFileSync(PAGE") < src.indexOf("http.createServer("), "and that read happens before any server is created");
 });
