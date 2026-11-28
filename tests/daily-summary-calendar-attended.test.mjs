@@ -281,7 +281,15 @@ test("an in-person record with no start, at a place the stop is not, is listed a
   assert.deepEqual(heads(d), ["9:00am · Home"]);
   const listed = eventsNotMatched(d);
   assert.equal(listed.length, 1);
-  assert.match(listed[0]._note, /took place at Corner Pharmacy; the time shown is the plan's, not when it happened/);
+  assert.match(listed[0]._note, /took place at Corner Pharmacy; the day does not show when/);
+  // no clock beside it: the calendar's hour is the plan's, not a moment it happened (HTML and the wiki markdown)
+  assert.equal(listed[0]._untimed, true);
+  const page = render.assemble(render.buildSkeleton(d, {}), { prose: {} });
+  assert.match(page, /<li>Pick up the parcel · /);
+  assert.ok(!/12:15pm/.test(page), "the plan's hour is not printed for a visit the day cannot time");
+  const wiki = render.buildMarkdown(d, { prose: {} });
+  assert.match(wiki, /- Pick up the parcel · /);
+  assert.ok(!/12:15/.test(wiki));
   // a stop the record names is where it was held, whatever the plan's place says
   assert.equal(attendedEvents(build(record({ where: { mode: "in_person", place: "Corner Pharmacy", stop_id: "s-1", elsewhere: false } }))).byStop["s-1"].length, 1);
   // a start of its own is the evidence the plan's hour lacks: drawn, as before
