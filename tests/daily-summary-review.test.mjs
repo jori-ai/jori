@@ -1106,3 +1106,21 @@ test("the reviewer reads our escapes as a mail client shows them, so a task with
   assert.equal(R.reportTextOf("<p>" + "x".repeat(50) + "</p>", 10), "x".repeat(10));
   assert.equal(R.headingTextOf("<h3>1:00pm · A &amp; B&#39;s</h3>"), "1:00pm · A & B's");
 });
+
+test("CLI: the same stop on both sides of a meeting block is one stop carrying on, not a split visit", () => {
+  setup();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsr-"));
+  try {
+    const stopH = (t) => `<h3 style="margin:0">${t} · <b>Library</b> · with Sam</h3><p>Reading.</p>`;
+    const meeting = `<h4 class="meeting" style="margin:0">about 10:00am · <b>Planning call</b></h4><p>The call.</p>`;
+    const dup = (f) => f.kind === "duplicate" && /Library/.test(f.detail);
+    fs.writeFileSync(FILES.report, `<h1>Day</h1>${stopH("9:14am")}${meeting}${stopH("11:00am")}`);
+    const withMeeting = JSON.parse(run(fakeClaude(dir, [{ issues: [], verdict: "publish" }]), ["--no-model"]).stdout);
+    assert.ok(!withMeeting.findings.some(dup), JSON.stringify(withMeeting.findings));
+    fs.writeFileSync(FILES.report, `<h1>Day</h1>${stopH("9:14am")}${stopH("11:00am")}`);
+    const bare = JSON.parse(run(fakeClaude(dir, [{ issues: [], verdict: "publish" }]), ["--no-model"]).stdout);
+    const found = bare.findings.filter(dup);
+    assert.equal(found.length, 1, JSON.stringify(bare.findings));
+    assert.equal(found[0].severity, "high");
+  } finally { CLEAN(); fs.rmSync(dir, { recursive: true, force: true }); }
+});

@@ -519,7 +519,7 @@ What it catches, all of which actually shipped:
 | `contradiction` | a hedged header above prose that states the place plainly; **2026-10-14: "7:00am · Café Antilia" against a night paragraph that has the user asleep until 7:29am** |
 | `impossible` | routed distance against movement time implying a pace nobody walks; stops that overlap |
 
-**A repeated place is not automatically a duplicate.** The user goes home in the morning, returns after lunch, and again at night — three real visits. The separator is the gap between them: entries for the same venue **within 2 hours** are one visit split in two (`high`); further apart is a genuine return (`low`, a note). Accommodation is exempt entirely.
+**A repeated place is not automatically a duplicate.** The user goes home in the morning, returns after lunch, and again at night — three real visits. The separator is the gap between them: entries for the same venue **within 2 hours** are one visit split in two (`high`); further apart is a genuine return (`low`, a note). Accommodation is exempt entirely. So is one stop on both sides of a meeting block (stop, meeting, stop: an `<h4 class="meeting">` between the two headers): a meeting the user was at splits the stop into blocks by design, and the check skips it (2026-11-28; the review once held a day over the same home stop headed before and after a video call).
 
 **Do not "fix" a finding by deleting the stop.** A `missing` finding means the user's own words are absent and must be added; an `invented` finding means the window should render as movement or as an unlabelled stop, never as a venue.
 
