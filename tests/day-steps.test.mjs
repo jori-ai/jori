@@ -1170,3 +1170,21 @@ test("a one-stop day whose legs outrun a day with no stride keeps the legs' figu
   assert.equal(info.unmeasured_walk, true);
   assert.match(buildSkeleton(d), /at least 2\.5 miles walked/);
 });
+
+// A drive out and back is headed with its own distance, but the header's "miles walked" is walking
+// only: a short drive's routed length once read as that many miles walked over a day of far fewer
+// steps than that distance takes on foot.
+test("a driving excursion keeps its own distance and is left out of the miles walked", () => {
+  const d = blockDay({ routed_m: 7000, geometry: "matched", steps: 600, mode: "driving" });
+  const block = d.stops[1];
+  assert.deepEqual(excursionDistance(block, d), { m: 7000, estimated: false });
+  assert.match(plain(stopHeaderHtml(block, d)), /4\.3 mi/);
+  assert.equal(Math.round(printedWalkMeters(d, d.stops)), 1200);
+  assert.match(buildSkeleton(d), /0\.7 miles walked/);
+  // the same block walked is counted
+  const walked = blockDay({ routed_m: 7000, geometry: "matched", steps: 600 });
+  assert.equal(Math.round(printedWalkMeters(walked, walked.stops)), 1200 + 7000);
+  // JORI_WALKED_COUNTS_DRIVES=1 counts the drive again
+  process.env.JORI_WALKED_COUNTS_DRIVES = "1";
+  try { assert.equal(Math.round(printedWalkMeters(d, d.stops)), 1200 + 7000); } finally { delete process.env.JORI_WALKED_COUNTS_DRIVES; }
+});

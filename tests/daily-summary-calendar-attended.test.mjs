@@ -259,3 +259,39 @@ test("the header count names the meetings drawn as blocks of their own", () => {
   assert.match(quiet, /2 stops/);
   assert.ok(!/meeting/.test(quiet), quiet);
 });
+
+// A record with no start of its own is laid out at the calendar's hour, and that hour used to pick
+// the stop that held it. An in-person errand planned for midday at a shop was drawn at the shop
+// while the phone had the user at home through that hour; the record itself said the stop was not
+// at the planned time. A place that is not the stop's, with no start and no stop of its own, is
+// listed with the plan's time called the plan's, not drawn.
+test("an in-person record with no start, at a place the stop is not, is listed and not drawn at the plan's hour", () => {
+  const record = (over = {}) => ({ summary: "Pick up the parcel", calendar: { start: iso("12:15"), end: iso("12:30"), location: "Corner Pharmacy, 5 Main St, Springfield" },
+    happened: { value: "yes" }, where: { mode: "in_person", place: "Corner Pharmacy", stop_id: null, elsewhere: false }, start: null, end: null,
+    participants: { names: [] }, what: { text: "You picked up the parcel." }, reason: "GPS has you at home then.", ...over });
+  const build = (rec) => {
+    const home = stop("s-1", "09:00", "15:00", "Home", { address: "12 Palm Way, Springfield" });
+    return { date: "2026-11-25", tz: TZ, tzs: [TZ], stops: [home], travel_legs: [], unmatched_calendar_events: [],
+      calendar_busy: [], meeting_records: { status: "ok", records: [rec] } };
+  };
+  const heads = (d) => [...render.assemble(render.buildSkeleton(d, {}), { prose: {} }).matchAll(/<h[34][^>]*>([\s\S]*?)<\/h[34]>/g)]
+    .map(m => m[1].replace(/<[^>]*>/g, "").trim());
+  const d = build(record());
+  assert.equal(attendedEvents(d).byStop["s-1"], undefined);
+  assert.deepEqual(heads(d), ["9:00am · Home"]);
+  const listed = eventsNotMatched(d);
+  assert.equal(listed.length, 1);
+  assert.match(listed[0]._note, /took place at Corner Pharmacy; the time shown is the plan's, not when it happened/);
+  // a stop the record names is where it was held, whatever the plan's place says
+  assert.equal(attendedEvents(build(record({ where: { mode: "in_person", place: "Corner Pharmacy", stop_id: "s-1", elsewhere: false } }))).byStop["s-1"].length, 1);
+  // a start of its own is the evidence the plan's hour lacks: drawn, as before
+  const timed = build(record({ start: iso("12:20"), end: iso("12:25") }));
+  assert.equal(attendedEvents(timed).byStop["s-1"].length, 1);
+  assert.deepEqual(eventsNotMatched(timed), []);
+  // a place that is the stop's own keeps its block
+  const here = build(record({ calendar: { start: iso("12:15"), end: iso("12:30"), location: "12 Palm Way, Springfield" }, where: { mode: "in_person", place: "Home", stop_id: null, elsewhere: false } }));
+  assert.equal(attendedEvents(here).byStop["s-1"].length, 1);
+  // JORI_RECORD_PLAN_CLOCK_PLACE=0 places it by the plan's clock again
+  process.env.JORI_RECORD_PLAN_CLOCK_PLACE = "0";
+  try { assert.equal(attendedEvents(d).byStop["s-1"].length, 1); } finally { delete process.env.JORI_RECORD_PLAN_CLOCK_PLACE; }
+});
