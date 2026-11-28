@@ -281,3 +281,46 @@ test("missing/corrupt state files degrade to null instead of throwing", () => {
   assert.deepEqual(pendingSlots(empty), { question: null, approval: null, canary: null });
   fs.rmSync(empty, { recursive: true, force: true });
 });
+
+// 2026-11-27: a question retired by the user's "Dismissed" stayed in the pending
+// slot and was shown as "Pending question … if their message answers it →
+// hum-answer" for a reply threaded to a different question; and a reply to a
+// question the ledger had already (wrongly) closed resolved to nothing.
+test("a slot question the ledger closed is not pending, and a reply to a closed question still names it", () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "hum-closed-"));
+  const L = (o) => JSON.stringify(o);
+  const lunchMsg = "66666666-6666-6666-6666-666666666666";
+  const placeMsg = "77777777-7777-7777-7777-777777777777";
+  fs.writeFileSync(path.join(d, "hum-pending-question.json"), L({
+    id: "q-place", question: "Did you stop at the bistro too?", delivered_msg_id: placeMsg, asked_at: past, expires_at: future,
+  }));
+  fs.writeFileSync(path.join(d, "open-questions.jsonl"), [
+    L({ ev: "asked", id: "evf-lunch", at: past, question: "How was lunch with everyone?", subject: "Lunch", lane: "event_followup", msg_id: lunchMsg }),
+    L({ ev: "asked", id: "q-place", at: past, question: "Did you stop at the bistro too?", subject: "place", lane: "location_context", msg_id: placeMsg }),
+    L({ ev: "answered", id: "evf-lunch", at: past, via: "hum-answer" }),
+    L({ ev: "retired", id: "q-place", at: past, why: "dismissed by the user" }),
+  ].join("\n") + "\n");
+  const prevData = process.env.JORI_DATA_DIR;
+  process.env.JORI_DATA_DIR = d;
+  try {
+    assert.equal(pendingSlots(d).question, null);
+    assert.ok(!openHumItems(d).some((it) => it.id === "q-place"));
+    const t = resolveHumTarget(lunchMsg, d);
+    assert.equal(t.kind, "question");
+    assert.equal(t.id, "evf-lunch");
+    assert.equal(t.closed.status, "answered");
+    const line = humRoutingLine(lunchMsg, d);
+    assert.match(line, /evf-lunch/); // lang-regex-ok: asserts on our own generated routing text, not the user's words
+    assert.match(line, /already marked it answered/); // lang-regex-ok: asserts on our own generated routing text, not the user's words
+    assert.doesNotMatch(line, /q-place/); // lang-regex-ok: asserts on our own generated routing text, not the user's words
+  } finally {
+    if (prevData === undefined) delete process.env.JORI_DATA_DIR; else process.env.JORI_DATA_DIR = prevData;
+    fs.rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test("a threaded reply's roster is reference only, anchored on the quoted parent", () => {
+  const block = humRoutingBlock({ replyTo: "bbbb", text: "yes we did" }, rosterDir);
+  assert.match(block, /This reply is THREADED/); // lang-regex-ok: asserts on our own generated routing text, not the user's words
+  assert.doesNotMatch(block, /ONE reply can answer several/); // lang-regex-ok: asserts on our own generated routing text, not the user's words
+});

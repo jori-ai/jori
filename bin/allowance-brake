@@ -29,8 +29,16 @@
 // from the job's own history: the median total_cost_usd of its last runs in
 // the job-costs ledgers, divided by what one whole allowance cost in the same
 // unit over the pace span (every ledger's spend / the utilization it moved).
-// When the span moved too little to rate, `usd_per_allowance` from the config
-// stands in. A per-job `cost_estimate` (share of the week) overrides both.
+// When the span moved too little to rate (the first day after a reset), the
+// last completed week's price stands in: `check` and `release` keep the price
+// of the window they are watching (ledger spend since the brake first saw it /
+// the utilization it moved since), and when the window resets, a week that
+// moved at least MIN_WEEK_DELTA becomes `last_week_price`, used for up to
+// KEEP_WEEK_PRICE_DAYS. A whole week is the steadier unit: the last day's span
+// runs low, because the last-day brake holds the very jobs that write the
+// ledger while usage the ledger does not see keeps moving the week. Only then
+// does `usd_per_allowance` from the config stand in. A per-job `cost_estimate`
+// (share of the week) overrides all three.
 //
 // A job is OVER when the week is already past the threshold, or when
 // projected + this run's estimate reaches it. What happens then is the job's
@@ -52,10 +60,16 @@
 //               the cheaper run on it, still ends under 100% (outside the
 //               final_day window), and the user is told afterwards on the
 //               system channel; the card is asked only past that.
+//               Inside the final_day window, a job whose run is estimated
+//               under final_day.small_share of the week runs on the usual
+//               model without a card, as long as the week, with the run on
+//               it, stays under final_day.small_ceiling. A job with no cost
+//               history is not small: it is still asked about.
 //
 // Config, the installation's decision: agent/local/config/allowance-brake.json
 //   { "threshold": 0.95, "usd_per_allowance": 1400,
-//     "final_day": { "hours": 24, "threshold": 0.90 },
+//     "final_day": { "hours": 24, "threshold": 0.90,
+//                    "small_share": 0.005, "small_ceiling": 0.98 },
 //     "jobs": { "<job>": { "importance": "optional|important|essential",
 //                          "release_label": "<launchd label>",
 //                          "cost_estimate": 0.02,
@@ -67,6 +81,8 @@
 // as interactive sessions, lands on top of it) and a held job waits at most
 // `hours` for the reset. Inside that stretch the lower of the two thresholds
 // applies, to `check` and `release` alike; absent, one threshold all week.
+// `small_share` and `small_ceiling` (optional, both or neither) let an
+// important job too small to matter run there without a card (see above).
 // No config file = the governor is off.
 //
 // FAIL-OPEN. No sample, a sample older than MAX_SAMPLE_AGE_H, a window younger
@@ -110,6 +126,8 @@ const EST_RUNS = 10;            // the estimate is the median of this many recen
 const EST_WINDOW_DAYS = 30;     // ... taken from the last month when the job ran in it
 const MIN_RATE_DELTA = 0.03;    // a span that moved the week less than this cannot price an allowance
 const DEFAULT_USD_PER_ALLOWANCE = 1400;
+const MIN_WEEK_DELTA = 0.3;        // a window that moved less than this since the brake first saw it cannot price a week
+const KEEP_WEEK_PRICE_DAYS = 21;   // a completed week's price older than this says nothing about this week
 const IMPORTANCE = new Set(["essential", "important", "optional"]);
 
 // The card's options. Fixed text: `apply` maps an answer back by exact match.
@@ -234,7 +252,11 @@ function reading(cfg) {
   const daysLeft = (resetMs - NOW) / 864e5;
   const span = { from: base.t, to: last.t, delta: last.u - base.u };
   if (util >= threshold) {
-    return { hold: true, reason: `the week is at ${pct(util)}, past the ${brake}; waits for the reset at ${resets_at}`, utilization: util, projected: util, pace_per_day: null, resets_at, span, threshold };
+    // Where the week would end at the day's plain pace. Only the last-day
+    // small-run check reads it: its ceiling is about where the week ends, not
+    // where it stands. Null when the span is too short to rate.
+    const paced = spanH >= MIN_RATE_SPAN_H ? +(util + Math.max(0, (last.u - base.u) / (spanH / 24)) * daysLeft).toFixed(3) : null;
+    return { hold: true, reason: `the week is at ${pct(util)}, past the ${brake}; waits for the reset at ${resets_at}`, utilization: util, projected: util, paced_projection: paced, pace_per_day: null, resets_at, span, threshold };
   }
   if (spanH < MIN_RATE_SPAN_H) return open(`only ${spanH.toFixed(1)}h of this window to rate; week at ${pct(util)}`, { utilization: util, resets_at });
   let catchUp = 0;
@@ -270,13 +292,51 @@ function catchUpShare(span) {
 
 const median = (xs) => { const s = [...xs].sort((a, b) => a - b); const n = s.length; return n ? (n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2) : null; };
 
-/** What one whole allowance cost (in ledger USD), from the pace span, or the config's stand-in. */
+/** What one whole allowance cost (in ledger USD): measured over the pace span; else the last completed week's price (rememberWeek); else the config's stand-in. */
 function usdPerAllowance(cfg, r, rows) {
   if (r && r.span && r.span.delta >= MIN_RATE_DELTA) {
     const spent = rows.filter((x) => x.t > r.span.from && x.t <= r.span.to).reduce((a, x) => a + x.usd, 0);
     if (spent > 0) return { usd: spent / r.span.delta, basis: "measured" };
   }
+  const w = readState().last_week_price;
+  const age = w ? NOW - Date.parse(w.resets_at || "") : NaN;
+  if (w && w.usd > 0 && age >= 0 && age <= KEEP_WEEK_PRICE_DAYS * 864e5) return { usd: w.usd, basis: "last week", week_ended: w.resets_at };
   return { usd: cfg.usd_per_allowance, basis: "config" };
+}
+
+/**
+ * Keep the price of the window the brake is watching in st.window_price:
+ * {resets_at, from, from_u, usd, moved, at}, the ledger spend since the brake
+ * first saw the window divided by the utilization it moved since. On the
+ * first look at a new window, the one before it, if it moved at least
+ * MIN_WEEK_DELTA, becomes st.last_week_price. Rewritten only when the price
+ * moves over 1% or is an hour old. Returns whether st changed.
+ */
+function rememberWeek(st, r, rows) {
+  if (!r || !r.resets_at || typeof r.utilization !== "number") return false;
+  let changed = false;
+  let w = st.window_price;
+  if (!w || w.resets_at !== r.resets_at) {
+    if (w && w.usd > 0 && w.moved >= MIN_WEEK_DELTA && Date.parse(w.resets_at || "") <= NOW) {
+      st.last_week_price = { usd: w.usd, moved: w.moved, resets_at: w.resets_at, at: w.at };
+    }
+    w = st.window_price = { resets_at: r.resets_at, from: new Date(NOW).toISOString(), from_u: r.utilization, usd: null, moved: 0, at: null };
+    changed = true;
+  }
+  const moved = r.utilization - w.from_u;
+  if (moved >= MIN_WEEK_DELTA) {
+    const from = Date.parse(w.from);
+    const spent = rows.filter((x) => x.t > from && x.t <= NOW).reduce((a, x) => a + x.usd, 0);
+    if (spent > 0) {
+      const usd = spent / moved;
+      const fresh = w.usd > 0 && Math.abs(w.usd - usd) / usd <= 0.01 && NOW - Date.parse(w.at || "") < 3600e3;
+      if (!fresh) {
+        Object.assign(w, { usd: +usd.toFixed(2), moved: +moved.toFixed(3), at: new Date(NOW).toISOString() });
+        changed = true;
+      }
+    }
+  }
+  return changed;
 }
 
 /** One run of `job` as a share of the week: {share, usd, runs, basis} (share 0 when unknown). */
@@ -322,9 +382,11 @@ function config() {
     const usd = Number(c.usd_per_allowance);
     const fd = c.final_day && typeof c.final_day === "object" ? c.final_day : {};
     const fdT = Number(fd.threshold), fdH = Number(fd.hours);
+    const fdS = Number(fd.small_share), fdC = Number(fd.small_ceiling);
+    const small = fdS > 0 && fdS < 1 && fdC > 0 && fdC <= 1 ? { small_share: fdS, small_ceiling: fdC } : {};
     return {
       threshold: threshold > 0 && threshold <= 1 ? threshold : 0.95,
-      final_day: fdT > 0 && fdT <= 1 && fdH > 0 ? { threshold: fdT, hours: fdH } : null,
+      final_day: fdT > 0 && fdT <= 1 && fdH > 0 ? { threshold: fdT, hours: fdH, ...small } : null,
       usd_per_allowance: usd > 0 ? usd : DEFAULT_USD_PER_ALLOWANCE,
       jobs: c.jobs && typeof c.jobs === "object" ? c.jobs : {},
       auto_cheaper: c.auto_cheaper === true,
@@ -432,6 +494,7 @@ function check(job) {
 
   const st = readState();
   const before = JSON.stringify(st);
+  try { rememberWeek(st, r, rows); } catch { /* the price waits for the next run */ }
   const save = () => { if (JSON.stringify(st) !== before) writeState(st); };
   const runNow = (decision, why, extra = {}) => {
     let held_since = null;
@@ -486,6 +549,18 @@ function check(job) {
     const note = `${entry.label || job} ran on the cheaper model (${entry.cheaper.model}) without asking: the week is at ${pct(r.utilization)} and on pace for ${pct(r.projected ?? r.utilization)}, so it still ends under 100%.`;
     notifyAfter(note);
     return runNow("cheaper", `${why}; ran on the cheaper model by your standing choice (projected under 100%)`, { model: entry.cheaper.model, effort: entry.cheaper.effort || null, auto: true });
+  }
+  // Standing choice (config final_day.small_share / small_ceiling): inside the
+  // last-day window a run too small to matter goes ahead on the usual model
+  // without a card, unless the week, with it on, would reach the ceiling. An
+  // unknown cost (no run history) is not small.
+  const fd = cfg.final_day || {};
+  const endsAt = r.paced_projection ?? r.projected ?? r.utilization;
+  const smallRun = lastDay && fd.small_share > 0 && est.share > 0 && est.share < fd.small_share
+    && endsAt + est.share < fd.small_ceiling;
+  if (smallRun) {
+    closeQuestions(st, job, "small run on the last day");
+    return runNow("run", `a small run (~${sharePct(est.share)} of the week) goes ahead on the last day without asking: the week is at ${pct(r.utilization)} and on pace for ${pct(endsAt)}, under the ${pct(fd.small_ceiling)} ceiling with it`, { small: true });
   }
   recordHeld(st, job, label, r);
   const pending = st.asks && st.asks[job];
@@ -554,6 +629,9 @@ function release() {
   // `check`, so a relaunched job is not simply held again. The one exception is
   // the user's own "wait for the reset", honoured until the reset.
   let rows = null;
+  if (!flag("dry-run")) {
+    try { rows = ledgerRows(); if (rememberWeek(st, r, rows)) changed = true; } catch { /* the price waits for the next run */ }
+  }
   for (const [job, h] of Object.entries(st.held || {})) {
     if (!h || !h.release_label || h.released_at) continue;
     const reset = Date.parse(h.resets_at || "") <= NOW;
@@ -593,7 +671,7 @@ function status() {
     return 0;
   }
   process.stdout.write(`${r.hold ? "HOLD" : "clear"}: ${r.reason}\n`);
-  process.stdout.write(`one allowance ~ $${Math.round(per.usd)} of ledger spend (${per.basis})\n`);
+  process.stdout.write(`one allowance ~ $${Math.round(per.usd)} of ledger spend (${per.basis}${per.week_ended ? `, the week that reset ${per.week_ended.slice(0, 10)}` : ""})\n`);
   for (const [j, v] of Object.entries(jobs)) {
     process.stdout.write(`  ${j.padEnd(28)} ${v.importance.padEnd(10)} ${v.estimate.share ? `~${(v.estimate.share * 100).toFixed(1)}%/run` : "no estimate"}${v.estimate.usd != null ? ` ($${v.estimate.usd} median of ${v.estimate.runs})` : ""}${st.held && st.held[j] ? "  [held]" : ""}\n`);
   }

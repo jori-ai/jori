@@ -16,7 +16,7 @@
     },
     "watcher": {
       "allow": ["self_status", "wiki_*", "recall", "recall_events", "episode_*", "context_search", "contacts_search",
-                "contacts_get", "contact_find", "whereami", "location_*", "findme_*", "geofence_check",
+                "contacts_get", "contact_find", "linkedin_connection_find", "whereami", "location_*", "findme_*", "geofence_check",
                 "places_nearby", "flight_status", "check_later", "notify_*", "email_mem_search", "watch_where",
                 "lights_status", "imsg_search", "imsg_read", "whatsapp_search", "whatsapp_read"],
       "deny": ["location_annotate"],

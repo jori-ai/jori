@@ -1096,3 +1096,95 @@ test("a gap loop the steps do not outrun, and a block the phone traced, keep the
     if (prev === undefined) delete process.env.JORI_GAP_LOOP_STEPS_FLOOR; else process.env.JORI_GAP_LOOP_STEPS_FLOOR = prev;
   }
 });
+
+// A day of one stop has no lines between stops for the header to sum, so it kept the spine's
+// walking legs and said nothing about the walk lines printed under the stop: a loop around
+// the house the phone drew 350 m of read "0.2 miles walked" over "Walk 7:55 to 8:15am · 20 min
+// · 1,420 steps", the same twenty minutes, and the reviewer held the day (2026-11-24).
+function oneStopDay(legSteps = true) {
+  return {
+    date: "2026-03-02", tz: "America/New_York", map_url: "https://example.test/map.png",
+    stops: [
+      { id: "home", start: "00:00", end: "23:00", start_ts_ms: at(0), end_ts_ms: at(23), duration_min: 1380, place: { name: "Home", source: "named_location" } },
+    ],
+    path: { spine: [
+      { type: "leg", id: "l0", mode: "walking", start_ms: at(8, 3), end_ms: at(8, 11), mins: 8,
+        routed_m: 350, straight_m: 227, walked_m: 350, geometry: "map_matched", fixes: 9, streets: [] },
+    ] },
+  };
+}
+const oneStopSteps = () => readings(at(7, 55), at(8, 15), 71);
+
+test("a one-stop day's miles are a floor when a walk line under the stop prints no distance", () => {
+  const d = oneStopDay();
+  annotateDaySteps(d, oneStopSteps(), null, { startMs: at(0), endMs: at(24) });
+  const text = (h) => h.replace(/<[^>]+>/g, "");
+  const html = buildSkeleton(d);
+  assert.match(text(html), /Walk 7:55 to 8:15am · 20 min · 1,4\d\d steps/);
+  assert.doesNotMatch(text(html), /Walk 7:55[^\n]*mi\b/);
+  assert.match(html, /at least 0\.2 miles walked/);
+  const info = {};
+  const m = _internal.oneStopWalkMeters(d, d.stops, 350, info);
+  assert.equal(m, 350);
+  assert.equal(info.unmeasured_walk, true);
+  // JORI_WALK_ONE_STOP_LINES=0 restores the legs' sum alone
+  const old = process.env.JORI_WALK_ONE_STOP_LINES;
+  process.env.JORI_WALK_ONE_STOP_LINES = "0";
+  try {
+    const off = oneStopDay();
+    annotateDaySteps(off, oneStopSteps(), null, { startMs: at(0), endMs: at(24) });
+    assert.doesNotMatch(buildSkeleton(off), /at least 0\.2 miles walked/);
+    assert.match(buildSkeleton(off), />0\.2 miles walked/);
+  } finally {
+    if (old == null) delete process.env.JORI_WALK_ONE_STOP_LINES; else process.env.JORI_WALK_ONE_STOP_LINES = old;
+  }
+});
+
+// A day whose mapped walk gives it a stride prints its step-found walk lines with a distance:
+// the header then says the lines' sum when it outruns the legs (the lines cover the legs'
+// minutes too, so the two are never added), and the legs' own figure when it does not.
+function strideDay(legM) {
+  const d = oneStopDay();
+  d.path.spine = [
+    { type: "leg", id: "l0", mode: "walking", start_ms: at(8, 3), end_ms: at(8, 31), mins: 28, steps: 2000,
+      routed_m: legM, straight_m: legM * 0.7, walked_m: legM, geometry: "map_matched", fixes: 30, streets: [] },
+  ];
+  annotateDaySteps(d, [...readings(at(8, 3), at(8, 31), 71), ...readings(at(15, 0), at(15, 40), 80)], null, { startMs: at(0), endMs: at(24) });
+  return d;
+}
+
+test("a one-stop day whose measured walk lines outrun its legs prints the lines' distance, said about", () => {
+  const d = strideDay(1400);
+  const info = {};
+  const m = _internal.oneStopWalkMeters(d, d.stops, 1400, info);
+  assert.ok(m > 3600 && m < 3700, String(m));      // 1,988 + 3,200 steps at about 0.7 m a step
+  assert.ok(info.estimated_m > 3600, JSON.stringify(info));
+  assert.equal(info.unmeasured_walk, undefined);
+  assert.match(buildSkeleton(d), /about 2\.3 miles walked/);
+});
+
+test("a one-stop day whose legs outrun a day with no stride keeps the legs' figure, said at least", () => {
+  const d = strideDay(4000);                         // 2 m a step: no walker's stride, so no distance on the lines
+  const info = {};
+  assert.equal(_internal.oneStopWalkMeters(d, d.stops, 4000, info), 4000);
+  assert.equal(info.unmeasured_walk, true);
+  assert.match(buildSkeleton(d), /at least 2\.5 miles walked/);
+});
+
+// A drive out and back is headed with its own distance, but the header's "miles walked" is walking
+// only: a short drive's routed length once read as that many miles walked over a day of far fewer
+// steps than that distance takes on foot.
+test("a driving excursion keeps its own distance and is left out of the miles walked", () => {
+  const d = blockDay({ routed_m: 7000, geometry: "matched", steps: 600, mode: "driving" });
+  const block = d.stops[1];
+  assert.deepEqual(excursionDistance(block, d), { m: 7000, estimated: false });
+  assert.match(plain(stopHeaderHtml(block, d)), /4\.3 mi/);
+  assert.equal(Math.round(printedWalkMeters(d, d.stops)), 1200);
+  assert.match(buildSkeleton(d), /0\.7 miles walked/);
+  // the same block walked is counted
+  const walked = blockDay({ routed_m: 7000, geometry: "matched", steps: 600 });
+  assert.equal(Math.round(printedWalkMeters(walked, walked.stops)), 1200 + 7000);
+  // JORI_WALKED_COUNTS_DRIVES=1 counts the drive again
+  process.env.JORI_WALKED_COUNTS_DRIVES = "1";
+  try { assert.equal(Math.round(printedWalkMeters(d, d.stops)), 1200 + 7000); } finally { delete process.env.JORI_WALKED_COUNTS_DRIVES; }
+});

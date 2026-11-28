@@ -60,7 +60,8 @@ it("holds a listed job when the week is on pace past the threshold, and records 
 it("holds a job without a release label but keeps no record for it", () => {
   const fx = fixture({ points: HOT });
   assert.equal(run(fx, ["check", "dream-deep"]).rc, 3);
-  assert.equal(fs.existsSync(fx.state), false);
+  const st = fs.existsSync(fx.state) ? JSON.parse(fs.readFileSync(fx.state, "utf8")) : {};
+  assert.equal((st.held || {})["dream-deep"], undefined, "no hold is recorded");
 });
 
 it("runs when the pace stays under the threshold", () => {
@@ -443,4 +444,141 @@ it("without auto_cheaper the same week still asks", () => {
   const fx = fixture({ points: WARM, config: GOV });
   const r = run(fx, ["check", "chat-build", "--json"]);
   assert.equal(r.rc, 3, r.out);
+});
+
+// ─── Small runs on the last day (the installation's standing choice) ────────
+// Inside the final_day window an important job whose run is under
+// final_day.small_share of the week runs on the usual model without a card,
+// unless the week, with it on, would reach final_day.small_ceiling.
+const SMALL = {
+  threshold: 0.95,
+  final_day: { hours: 24, threshold: 0.90, small_share: 0.005, small_ceiling: 0.98 },
+  jobs: {
+    "tiny": { importance: "important", cost_estimate: 0.002, release_label: "ai.test.tiny" },
+    "medium": { importance: "important", cost_estimate: 0.04 },
+    "unknown": { importance: "important" },
+    "tiny-optional": { importance: "optional", cost_estimate: 0.002 },
+  },
+};
+
+it("last day: a small important run goes ahead without a card while the week stays under the ceiling", () => {
+  const fx = fixture({ points: LAST_DAY, config: SMALL });
+  const r = run(fx, ["check", "tiny", "--json"], LAST_DAY_NOW);
+  assert.equal(r.rc, 0, r.out);
+  assert.equal(r.json.decision, "run");
+  assert.equal(r.json.small, true);
+  assert.equal(r.json.threshold, 0.90);
+  const st = fs.existsSync(fx.state) ? JSON.parse(fs.readFileSync(fx.state, "utf8")) : {};
+  assert.equal((st.questions || []).length, 0, "no card");
+  assert.equal((st.held || {}).tiny, undefined, "not held");
+});
+
+it("last day: past the brake but on a slow pace, a small run still goes ahead", () => {
+  // 0.90 -> 0.91 over 22h: past the 90% last-day brake, on pace for ~92%.
+  const fx = fixture({ points: [["2026-11-03T13:00:00Z", 0.90], ["2026-11-04T11:00:00Z", 0.91]], config: SMALL });
+  const r = run(fx, ["check", "tiny", "--json"], LAST_DAY_NOW);
+  assert.equal(r.rc, 0, r.out);
+  assert.equal(r.json.small, true);
+});
+
+it("last day: a small run is asked about when the week is on track to reach the ceiling", () => {
+  // 0.88 -> 0.95 over 22h: ~7.6%/day, 16h left, so on pace for about 100%.
+  const fx = fixture({ points: [["2026-11-03T13:00:00Z", 0.88], ["2026-11-04T11:00:00Z", 0.95]], config: SMALL });
+  const r = run(fx, ["check", "tiny", "--json"], LAST_DAY_NOW);
+  assert.equal(r.rc, 3, r.out);
+  assert.match(r.json.reason, /asked you/); // lang-regex-ok: asserts the governor's own output, not the user's words
+  assert.ok(r.json.paced_projection >= 0.98, `paced ${r.json.paced_projection}`);
+});
+
+it("last day: a bigger run, one with no cost history, and an optional job are handled as before", () => {
+  const fx = fixture({ points: LAST_DAY, config: SMALL });
+  assert.match(run(fx, ["check", "medium", "--json"], LAST_DAY_NOW).json.reason, /asked you/); // lang-regex-ok: the governor's own output
+  assert.match(run(fx, ["check", "unknown", "--json"], LAST_DAY_NOW).json.reason, /asked you/); // lang-regex-ok: the governor's own output
+  const opt = run(fx, ["check", "tiny-optional", "--json"], LAST_DAY_NOW);
+  assert.equal(opt.rc, 3, "optional jobs are still held without asking");
+  assert.equal(opt.json.small, undefined);
+});
+
+it("a small run is still asked about earlier in the week, and without the setting on the last day", () => {
+  const early = fixture({ points: HOT, config: SMALL });
+  const e = run(early, ["check", "tiny", "--json"]);
+  assert.equal(e.rc, 3, e.out);
+  assert.match(e.json.reason, /asked you/); // lang-regex-ok: the governor's own output
+  const off = fixture({ points: LAST_DAY, config: { ...SMALL, final_day: { hours: 24, threshold: 0.90 } } });
+  const o = run(off, ["check", "tiny", "--json"], LAST_DAY_NOW);
+  assert.equal(o.rc, 3, o.out);
+  assert.equal(o.json.small, undefined);
+});
+
+// ─── The first day after a reset is priced from the last completed week ────
+// check and release keep the price of the window they watch (ledger spend since
+// the brake first saw it / the utilization it moved); when the window resets, a
+// week that moved enough becomes last_week_price, the stand-in for the young window.
+function ledger(fx, rows) {
+  const dir = path.join(fx.logs, "ephemeral-forks");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "job-costs.ndjson"), rows.map((x) => JSON.stringify(x)).join("\n") + "\n");
+}
+const NEXT_RESET = Date.parse("2026-11-12T03:00:00Z") / 1000;
+
+it("prices the first day after a reset from the week before, not the config's stand-in", () => {
+  // First look at the window (Nov 1 08:00, week at 0.45): nothing to price yet.
+  const fx = fixture({ points: [["2026-10-31T09:00:00Z", 0.40], ["2026-11-01T08:00:00Z", 0.45]], config: { ...GOV, usd_per_allowance: 5000 } });
+  ledger(fx, [
+    { ts: "2026-11-01T12:00:00Z", source: "dream", total_cost_usd: 100 },
+    { ts: "2026-11-02T06:00:00Z", source: "hum", total_cost_usd: 200 },
+    { ts: "2026-11-02T07:00:00Z", source: "hum", total_cost_usd: 100 },
+  ]);
+  run(fx, ["release"], "2026-11-01T08:05:00Z");
+  let st = JSON.parse(fs.readFileSync(fx.state, "utf8"));
+  assert.equal(st.window_price.from_u, 0.45);
+  assert.equal(st.window_price.usd, null);
+  // A day later the week has moved 0.40 since then on $400 of ledger spend: $1000 a week.
+  fs.writeFileSync(path.join(fx.logs, "supervisor-ops", "events.ndjson"), [["2026-11-01T08:00:00Z", 0.45], ["2026-11-02T07:50:00Z", 0.85]]
+    .map(([ts, u]) => JSON.stringify({ ts, kind: "rate_limit_event", rate_limit_info: { unifiedWindows: { seven_day: { utilization: u, resetsAt: RESET } } } })).join("\n") + "\n");
+  run(fx, ["release"]);
+  st = JSON.parse(fs.readFileSync(fx.state, "utf8"));
+  assert.equal(Math.round(st.window_price.usd), 1000);
+  assert.equal(st.last_week_price, undefined, "the week has not reset yet");
+  // After the reset: a young window, which cannot price itself.
+  fs.writeFileSync(path.join(fx.logs, "supervisor-ops", "events.ndjson"), [["2026-11-05T04:00:00Z", 0.01], ["2026-11-05T09:00:00Z", 0.04]]
+    .map(([ts, u]) => JSON.stringify({ ts, kind: "rate_limit_event", rate_limit_info: { unifiedWindows: { seven_day: { utilization: u, resetsAt: NEXT_RESET } } } })).join("\n") + "\n");
+  const later = "2026-11-05T09:10:00Z";
+  run(fx, ["check", "dream", "--json"], later);
+  st = JSON.parse(fs.readFileSync(fx.state, "utf8"));
+  assert.equal(Math.round(st.last_week_price.usd), 1000);
+  assert.equal(st.window_price.resets_at, "2026-11-12T03:00:00.000Z", "a new window is being watched");
+  const s = run(fx, ["status", "--json"], later);
+  assert.equal(s.json.usd_per_allowance.basis, "last week");
+  assert.equal(Math.round(s.json.usd_per_allowance.usd), 1000);
+  assert.match(run(fx, ["status"], later).out, /\$1000 of ledger spend \(last week, the week that reset 2026-11-05\)/); // lang-regex-ok: the governor's own output
+});
+
+it("a week that moved too little, or a price over three weeks old, gives way to the config", () => {
+  const young = fixture({ points: [["2026-11-02T05:00:00Z", 0.05], ["2026-11-02T07:50:00Z", 0.12]], config: { ...GOV, usd_per_allowance: 5000 } });
+  fs.writeFileSync(young.state, JSON.stringify({ last_week_price: { usd: 1000, resets_at: "2026-10-08T03:00:00.000Z" } }));
+  assert.equal(run(young, ["status", "--json"]).json.usd_per_allowance.basis, "config");
+  // The previous window moved only 0.2 since the brake first saw it: not a week's price.
+  const st = { window_price: { resets_at: "2026-10-29T03:00:00.000Z", from: "2026-10-28T10:00:00.000Z", from_u: 0.75, usd: 900, moved: 0.2, at: "2026-10-29T02:00:00.000Z" } };
+  fs.writeFileSync(young.state, JSON.stringify(st));
+  run(young, ["check", "dream"]);
+  const after = JSON.parse(fs.readFileSync(young.state, "utf8"));
+  assert.equal(after.last_week_price, undefined);
+  assert.equal(run(young, ["status", "--json"]).json.usd_per_allowance.usd, 5000);
+});
+
+it("a window that can price itself still uses its own measurement, and a dry-run release writes nothing", () => {
+  const fx = fixture({ points: HOT, config: GOV });
+  ledger(fx, [
+    { ts: "2026-11-01T10:00:00Z", source: "dream", total_cost_usd: 10 },
+    { ts: "2026-11-01T22:00:00Z", source: "dream", total_cost_usd: 10 },
+    { ts: "2026-11-02T05:00:00Z", source: "hum", total_cost_usd: 190 },
+  ]);
+  fs.writeFileSync(fx.state, JSON.stringify({ last_week_price: { usd: 4000, resets_at: "2026-10-29T03:00:00.000Z" } }));
+  const s = run(fx, ["status", "--json"]);
+  assert.equal(s.json.usd_per_allowance.basis, "measured");
+  assert.equal(Math.round(s.json.usd_per_allowance.usd), 1000);
+  const before = fs.readFileSync(fx.state, "utf8");
+  run(fx, ["release", "--dry-run"]);
+  assert.equal(fs.readFileSync(fx.state, "utf8"), before);
 });

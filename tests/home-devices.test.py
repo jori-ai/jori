@@ -342,15 +342,35 @@ class HomeDevicesTest(unittest.TestCase):
         self.fake.lan["192.0.2.21"] = "ping"
         self.fake.lan["192.0.2.22"] = "ping"
         self.fake.neigh = [
-            "192.0.2.21 dev br-lan lladdr 02:00:00:00:00:01 REACHABLE",
-            "192.0.2.99 dev br-lan lladdr 02:00:00:00:00:a2 STALE",  # an older address of the extender
-            "192.0.2.22 dev br-lan lladdr 02:00:00:00:00:a2 REACHABLE",  # the fresh one wins
+            "192.0.2.98 dev br-lan lladdr 02:00:00:00:00:01 STALE",  # an older address of the lamp
+            "192.0.2.21 dev br-lan lladdr 02:00:00:00:00:01 REACHABLE",  # the fresh one wins
+            "192.0.2.22 dev br-lan lladdr 02:00:00:00:00:a2 REACHABLE",  # the extender, at one address only
             "fe80::1 dev br-lan lladdr 02:00:00:00:00:03 REACHABLE",  # IPv6 is no evidence
         ]
         res = mod.check_all(mod.roster_cfg())
         self.assertEqual(res["Test lamp"], (True, "192.0.2.21 ping (no lease record, from ARP table)"))
         self.assertEqual(res["Test extender client"], (True, "192.0.2.22 ping (no lease record, from ARP table)"))
         self.assertEqual(res["Test doorbell"], (True, "192.0.2.13 ping"))  # still has its lease
+
+    def test_an_extender_seen_at_several_addresses_is_not_taken_for_one_device(self):
+        # An extender answers for every device behind it, so its MAC at two
+        # addresses does not say which is this device's: it is not taken, and
+        # with half the lease list gone the device is not judged rather than
+        # judged at a guessed address.
+        mod = self.load()
+        del self.fake.leases["02:00:00:00:00:01"]
+        del self.fake.leases["02:00:00:00:00:02"]
+        self.fake.lan["192.0.2.21"] = "ping"
+        self.fake.lan["192.0.2.22"] = "ping"
+        self.fake.neigh = [
+            "192.0.2.21 dev br-lan lladdr 02:00:00:00:00:01 REACHABLE",
+            "192.0.2.99 dev br-lan lladdr 02:00:00:00:00:a2 STALE",
+            "192.0.2.22 dev br-lan lladdr 02:00:00:00:00:a2 REACHABLE",
+        ]
+        res = mod.check_all(mod.roster_cfg())
+        self.assertEqual(res["Test lamp"], (True, "192.0.2.21 ping (no lease record, from ARP table)"))
+        self.assertIsNone(res["Test extender client"][0])
+        self.assertIn("couldn't check", res["Test extender client"][1])
 
     def test_missing_lease_and_no_usable_arp_entry_is_still_down(self):
         mod = self.load()
@@ -863,6 +883,62 @@ class HomeDevicesTest(unittest.TestCase):
             self.sweep(mod)
         self.assertEqual(len(self.fake.emails), 1)  # after the window, alerted as usual
 
+    # ── the daily section stays short on a day many devices changed ─────────
+
+    def daily_roster(self, plugs, bulbs, extra=()):
+        roster = json.loads(json.dumps(ROSTER))
+        roster["sites"]["den"] = {"label": "Den", "kind": "cloud"}
+        roster["devices"] += [{"site": "den", "name": f"Smart plug 02:00:00:00:01:{i:02x} (Den)", "tier": "daily"} for i in range(plugs)]
+        roster["devices"] += [{"site": "den", "name": f"Smart bulb 02:00:00:00:02:{i:02x} (Den)", "tier": "daily"} for i in range(bulbs)]
+        roster["devices"] += [{"site": "den", "name": n, "tier": "daily"} for n in extra]
+        self.write("config/home-devices.json", roster)
+
+    def test_daily_section_groups_a_long_list_and_still_names_every_device_offline(self):
+        # 14 plugs offline since before the last summary, 10 bulbs that were off
+        # and came back, 2 bulbs that went off since, the washer off, 3 online.
+        self.daily_roster(14, 15, extra=("Washer", "Dryer", "Kettle"))
+        mod = self.load()
+        before, today = "2026-01-04T09:00:00+00:00", "2026-01-05T21:00:00+00:00"
+        devices, events = {}, []
+        for i in range(14):
+            devices[f"Smart plug 02:00:00:00:01:{i:02x} (Den)"] = {"status": "down", "since": before}
+        for i in range(10):
+            n = f"Smart bulb 02:00:00:00:02:{i:02x} (Den)"
+            devices[n] = {"status": "up"}
+            events.append({"kind": "up", "name": n, "at": "2026-01-05T11:54:00+00:00", "since": before, "seeded": False})
+        for i in (10, 11):
+            n = f"Smart bulb 02:00:00:00:02:{i:02x} (Den)"
+            devices[n] = {"status": "down", "since": today}
+            events.append({"kind": "down", "name": n, "at": today})
+        devices["Washer"] = {"status": "down", "since": before}
+        text = mod.daily_text(mod.roster_cfg(), {"devices": devices, "daily_events": events}, "2026-01-05T23:55:00+00:00")
+        lines = [l for l in text.splitlines() if l.startswith("- ")]
+        self.assertLess(len(lines), 6, text)
+        for i in range(14):
+            self.assertIn(f"01:{i:02x}", text)  # every device still offline is named
+        self.assertIn("Smart plug (Den): 14 still offline since Jan 4, 9:00 AM:", text)
+        self.assertIn("Smart bulb (Den): 2 went offline at 9:00 PM: 02:00:00:00:02:0a, 02:00:00:00:02:0b.", text)
+        self.assertIn("- Washer: offline since Jan 4, 9:00 AM.", text)
+        self.assertIn("- 10 were offline for a while and came back (Smart bulb: 10)", text)
+        self.assertNotIn("02:00:00:00:02:05", text)  # a device that came back is counted, not listed
+        self.assertIn("The other 5 were online.", text)
+        self.assertNotIn("\u2014", text)
+
+    def test_daily_section_keeps_one_line_per_device_when_short(self):
+        self.daily_roster(3, 0)
+        mod = self.load()
+        devices = {f"Smart plug 02:00:00:00:01:{i:02x} (Den)": {"status": "down", "since": "2026-01-04T09:00:00+00:00"} for i in range(3)}
+        text = mod.daily_text(mod.roster_cfg(), {"devices": devices, "daily_events": []}, "2026-01-05T23:55:00+00:00")
+        self.assertIn("- Smart plug 02:00:00:00:01:00 (Den): offline since Jan 4, 9:00 AM.", text)
+        self.assertEqual(len([l for l in text.splitlines() if l.startswith("- ")]), 3)
+
+    def test_device_type_is_read_from_the_name_shape(self):
+        mod = self.load()
+        self.assertEqual(mod._kind_and_id("Smart plug 0a:1b:2c (Den)"), ("Smart plug", "0a:1b:2c", "(Den)"))
+        self.assertEqual(mod._kind_and_id("Unidentified device 9f:48"), ("Unidentified device", "9f:48", ""))
+        self.assertEqual(mod._kind_and_id("Washer"), (None, "Washer", ""))
+        self.assertEqual(mod._kind_and_id("0a:1b:2c"), (None, "0a:1b:2c", ""))
+        self.assertEqual(mod._kind_and_id("Camera 12:00 noon"), ("Camera", "12:00", "noon"))
 
 if __name__ == "__main__":
     unittest.main()

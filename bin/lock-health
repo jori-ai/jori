@@ -278,7 +278,10 @@ async function cmdCheck() {
   const names = await propertyNames();
   const byLock = lh.needsByLock(needs, readings);
   const planned = lh.plan({ readings, state, needs: byLock, nowMs, cfg: SETTINGS, unread });
-  const msg = lh.compose({ alerts: planned.alerts, recoveries: planned.recoveries, propertyNames: names, tz: TZ });
+  const msg = lh.compose({
+    alerts: planned.alerts, recoveries: planned.recoveries, propertyNames: names, tz: TZ,
+    history: state.alert_history || {}, lastGateway: planned.state.last_gateway || {}, nowMs,
+  });
 
   if (has("--json")) console.log(JSON.stringify({ readings: readings.length, needs: needs.length, alerts: planned.alerts.length, recoveries: planned.recoveries.length, message: msg?.text || null }));
   if (DRY) {
@@ -288,8 +291,10 @@ async function cmdCheck() {
   }
   let next = planned.state;
   if (msg) {
+    let delivered = false;
     try {
       send(msg.text, msg.push);
+      delivered = true;
       log(`sent: ${planned.alerts.length} alert(s), ${planned.recoveries.length} recovery(ies)`);
     } catch (e) {
       // Not sent, so not said: the new alerts and the recoveries stay pending
@@ -300,6 +305,8 @@ async function cmdCheck() {
       for (const { recovered_at, ...c } of planned.recoveries) next.conditions[lh.conditionKey(c.lock, c.kind)] = c;
       process.exitCode = 1;
     }
+    // Only a page that was sent counts toward "Nth page for this lock".
+    if (delivered) next = lh.recordDelivered(next, planned.alerts, nowMs);
   }
   writeState(next);
   log(`${readings.length} locks, ${needs.length} upcoming needs, ${Object.keys(next.conditions).length} open condition(s)`);

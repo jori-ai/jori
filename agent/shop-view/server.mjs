@@ -8,10 +8,12 @@
 //   frames  Page.startScreencast on the selected tab while someone is watching
 //           (stops 20s after the last frame request); the page long-polls
 //           GET /api/frame?after=<seq> for the newest JPEG.
-//   input   POST /api/input {type: tap|scroll|text|key|navigate|back|forward|
+//   input   POST /api/input {type: tap|scroll|drag|text|key|navigate|back|forward|
 //           reload|tab|phone|done}. Taps are real mouse events
 //           (Input.dispatchMouseEvent), a swipe on the picture is mouse-wheel
-//           scrolling at the finger's spot, text is one keyDown/keyUp per
+//           scrolling at the finger's spot (Drag mode on the page sends the traced path
+//           as one real mouse drag: press, moves with the left button held,
+//           release), text is one keyDown/keyUp per
 //           character — the same trusted input shop-browser.mjs uses, because
 //           merchant bot sensors refuse synthetic JS clicks.
 //   hold    the tab, and the phone layout with it, is kept for HOLD_MS after
@@ -68,6 +70,11 @@ const LONGPOLL_MS = 12_000;
 const DONE_FILE = path.join(ROOT, "data/purchases/shop-view-done.json");
 const LOG = path.join(ROOT, "agent/logs/shop-view.log");
 const PAGE = path.join(HERE, "page.html");
+// Read once, at start, like the code that answers the page's requests: a page
+// read per request ran ahead of this process after a change landed (a new button
+// posting an action the running code did not know). stale-code-watch restarts
+// this daemon when page.html or its code changes, so the two always arrive together.
+const PAGE_HTML = fs.readFileSync(PAGE, "utf8");
 // Phone layout: a mobile viewport the size of the picture on the user's phone
 // (V.phoneMetrics), so a desktop form is readable there. Emulation overrides
 // belong to OUR CDP session and vanish when it closes, so the shop tab can
@@ -184,6 +191,27 @@ async function act(a, email) {
       const p = V.toViewport(a.x, a.y, S.meta);
       if (!p) throw new Error("no frame yet — wait for the picture");
       await s.send("Input.dispatchMouseEvent", { type: "mouseWheel", x: p.x, y: p.y, ...V.scrollDelta(a, S.meta) });
+      return;
+    }
+    case "drag": {
+      // A real drag (a "slide to verify" handle): press, moves with the left
+      // button held, release. Not a wheel scroll.
+      const path = V.dragPath(a.points, S.meta);
+      if (!path) throw new Error("no frame yet — wait for the picture");
+      const first = path[0], end = path[path.length - 1];
+      await s.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: first.x, y: first.y });
+      await s.send("Input.dispatchMouseEvent", { type: "mousePressed", x: first.x, y: first.y, button: "left", buttons: 1, clickCount: 1 });
+      try {
+        await B.sleep(80);
+        for (const p of path.slice(1)) {
+          await s.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y, button: "left", buttons: 1 });
+          await B.sleep(12);
+        }
+        await B.sleep(80);
+      } finally {
+        // Always let go, so a failed move never leaves the shop Chrome's button held down.
+        await s.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: end.x, y: end.y, button: "left", buttons: 0, clickCount: 1 }).catch(() => {});
+      }
       return;
     }
     case "text":
@@ -347,7 +375,7 @@ async function handle(req, res, listener) {
   if (req.method === "GET" && url.pathname === "/") {
     // The page names the assistant by its configured name (lib/instance.cjs).
     const name = assistantName().replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[ch]);
-    const page = fs.readFileSync(PAGE, "utf8").replace('<html lang="en">', `<html lang="en" data-assistant="${name}">`);
+    const page = PAGE_HTML.replace('<html lang="en">', `<html lang="en" data-assistant="${name}">`);
     return send(res, 200, page, {
       "Content-Type": "text/html; charset=utf-8",
       "Content-Security-Policy": "default-src 'self'; img-src 'self' blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",

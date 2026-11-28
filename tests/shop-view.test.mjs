@@ -12,6 +12,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
@@ -159,6 +160,28 @@ test("scrollDelta: a swipe of a share of the picture scrolls the same share of t
   assert.deepEqual(V.scrollDelta({ fdy: 5 }, { deviceWidth: 390, deviceHeight: 2000 }), { deltaX: 0, deltaY: 3000 });
 });
 
+test("parseAction: a drag is a path of at least two points", () => {
+  assert.deepEqual(V.parseAction({ type: "drag", points: [{ x: 0.1, y: 0.5 }, { x: "0.8", y: 0.5 }] }), { type: "drag", points: [{ x: 0.1, y: 0.5 }, { x: 0.8, y: 0.5 }] });
+  assert.equal(V.parseAction({ type: "drag", points: Array.from({ length: 999 }, (_, i) => ({ x: i / 999, y: 0.5 })) }).points.length, V.DRAG_MAX_POINTS);
+  for (const bad of [{ type: "drag" }, { type: "drag", points: [{ x: 0.1, y: 0.1 }] }, { type: "drag", points: [{ x: 0.1, y: 0.1 }, { x: "a", y: 1 }] }]) {
+    assert.throws(() => V.parseAction(bad), undefined, JSON.stringify(bad));
+  }
+});
+
+test("dragPath: maps the traced path onto the viewport and fills wide gaps so the handle sees moves", () => {
+  const meta = { deviceWidth: 400, deviceHeight: 800, offsetTop: 0 };
+  const path = V.dragPath([{ x: 0, y: 0.5 }, { x: 1, y: 0.5 }], meta);
+  assert.deepEqual(path[0], { x: 0, y: 400 });
+  assert.deepEqual(path[path.length - 1], { x: 400, y: 400 });
+  assert.ok(path.length >= 30, "a 400px flick of two points becomes a run of moves");
+  for (let i = 1; i < path.length; i++) assert.ok(path[i].x >= path[i - 1].x && path[i].x - path[i - 1].x <= 12);
+  const huge = V.dragPath([{ x: 0, y: 0 }, { x: 1, y: 1 }], { deviceWidth: 5000, deviceHeight: 5000 });
+  assert.ok(huge.length <= V.DRAG_MAX_POINTS, "capped");
+  assert.deepEqual(V.dragPath([{ x: 0.2, y: 0.2 }, { x: 0.2, y: 0.2 }], meta).length, 2, "no movement, no filler");
+  assert.equal(V.dragPath([{ x: 0, y: 0 }, { x: 1, y: 1 }], null), null, "no frame yet");
+  assert.equal(V.dragPath([{ x: 0, y: 0 }], meta), null);
+});
+
 test("phoneMetrics: phone view is laid out at the picture's size, bigger when zoomed out", () => {
   assert.deepEqual(V.phoneMetrics({ width: 390, height: 407 }), { width: 390, height: 407, deviceScaleFactor: 2, mobile: true });
   assert.deepEqual(V.phoneMetrics({ width: 390, height: 407, zoom: 0.5 }), { width: 780, height: 814, deviceScaleFactor: 2, mobile: true });
@@ -302,4 +325,14 @@ test("appSigninLink: the app address when configured, null otherwise", () => {
   assert.equal(V.appSigninLink({ base: "http://mini:9088", site: "hertz.com" }), "http://mini:9088/?open=https%3A%2F%2Fhertz.com%2F&site=hertz.com");
   assert.equal(V.appSigninLink({ site: "x.com" }, { SHOP_VIEW_APP_URL: "http://m:1/" }), "http://m:1/?open=https%3A%2F%2Fx.com%2F&site=x.com");
   if (!V.DEFAULT_APP_URL) assert.equal(V.appSigninLink({ site: "x.com" }, {}), null);
+});
+
+// Regression guard for a page that runs ahead of the server code that answers it:
+// reading page.html per request served a new button the instant it landed, while
+// the running process still had the old action parser ("unknown action drag").
+test("server: page.html is read once at start, never inside a request handler", () => {
+  const src = fs.readFileSync(path.join(REPO, "agent/shop-view/server.mjs"), "utf8");
+  const reads = src.split("readFileSync(PAGE").length - 1;
+  assert.equal(reads, 1, "page.html is read in exactly one place");
+  assert.ok(src.indexOf("readFileSync(PAGE") < src.indexOf("http.createServer("), "and that read happens before any server is created");
 });

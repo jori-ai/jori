@@ -4,6 +4,7 @@
 //
 // Env (set by the runner in the one-shot's --mcp-config, nothing else):
 //   TRIAGE_MESSAGE_ID, TRIAGE_FROM, TRIAGE_SUBJECT, TRIAGE_DATE  the email
+//   TRIAGE_STAMPS  intake's stamp codes, comma-separated (a standing P1 cannot be undone)
 //   TRIAGE_STATE   a JSON-lines file each changing tool appends to
 //   TRIAGE_DRY=1   record what would change, change nothing
 // Design: docs/email-triage-strict.md.
@@ -38,6 +39,7 @@ const tools = makeTools({
     from: process.env.TRIAGE_FROM || "",
     subject: process.env.TRIAGE_SUBJECT || "",
     dateIso: process.env.TRIAGE_DATE || "",
+    stamps: String(process.env.TRIAGE_STAMPS || "").split(",").filter(Boolean),
   },
   run, record, dry: process.env.TRIAGE_DRY === "1",
 });

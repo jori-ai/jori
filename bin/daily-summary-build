@@ -43,7 +43,7 @@
 const fs = require("fs");
 const path = require("path");
 const { spawnSync } = require("child_process");
-const { buildManifest, buildSkeleton, assemble, photosNotShown, attachNearMissEvents, _internal: { isMainStop } } = require("../lib/daily-summary-render.js");
+const { buildManifest, buildSkeleton, assemble, photosNotShown, attachNearMissEvents, skeletonBlocks, _internal: { isMainStop } } = require("../lib/daily-summary-render.js");
 const { selectStandouts, chargesOfDay } = require("../lib/daily-summary-transactions.js");
 const { linkStandoutsToStops, placesBesidePhotos } = require("../lib/standout-stop-link.js");
 const { settleDay } = require("../lib/daily-summary-day.js");
@@ -51,7 +51,7 @@ const { fetchCompletedTasks, localizeTasksToStops } = require("../lib/daily-summ
 const { dayCommits, routineTags } = require("../lib/daily-summary-commits.js");
 const { request } = require("../lib/supabase-rest.js");
 const { getDisplayTzForDate } = require("../lib/travel-timezone.js");
-const { harvestDay, countColumns, readCorrections, applyCorrectionArrivals } = require("../lib/daily-summary-harvest.js");
+const { harvestDay, countColumns, readCorrections, applyCorrectionArrivals, applyCorrectionEventTimes } = require("../lib/daily-summary-harvest.js");
 const { dayWindow: dayWindowOf, boundaryTzOf, defaultTz } = require("../lib/day-window.js");
 const { installTools } = require("../lib/root.cjs");
 const { crossesZones } = require("../lib/geo-timezone.js");
@@ -278,6 +278,63 @@ async function attachCalls(date, resolved) {
   await hook.attachCalls({ date, tz: boundaryTzOf(resolved), resolved, tmp: TMP, bin: BIN, boundaryTzOf });
 }
 
+// The day's meeting records (bin/meeting-record, lib/meeting-record.mjs;
+// 2026-11-27, the user: "calendar meetings do not accurately reflect real life.
+// We can't place them in the spine automatically."). For each timed meeting or
+// engagement of the day a model settles, from every signal Jori has, whether it
+// happened, where and how, when it really began and ended, who took part and
+// what took place; the render draws a meeting block only from a record that
+// says it happened, at the record's own times and place. The step runs here,
+// with the settled stops, when its file is missing or older than the user's
+// words, the day's corrections, or a reply to one of its questions; a failed
+// run is not retried for an hour. With no file the day's meetings are listed
+// as scheduled and none is drawn (status "failed"). Then any question a record
+// carries is offered to `meeting-record ask`, which keeps quiet hours and
+// pacing itself. JORI_MEETING_RECORDS=0 restores the calendar-and-GPS
+// placement (no records on the day); JORI_MEETING_RECORD_ASK=0 asks nothing.
+function attachMeetingRecords(date, resolved, tz) {
+  if (process.env.JORI_MEETING_RECORDS === "0") { delete resolved.meeting_records; return; }
+  const out = path.join(TMP, `meeting-records-${date}.json`), failed = `${out}.failed`;
+  const mtime = (p) => { try { return fs.statSync(p).mtimeMs; } catch { return 0; } };
+  const { DAY_CORRECTIONS_DIR } = require("../lib/daily-summary-harvest.js");
+  const inputs = [path.join(TMP, `day-statements-${date}.json`), path.join(DAY_CORRECTIONS_DIR, `${date}.jsonl`)];
+  try {
+    const st = JSON.parse(fs.readFileSync(require("../lib/root.cjs").installTools("data/meeting-records/state.json"), "utf8"));
+    if (Object.values(st.questions || {}).some((q) => q.date === date && q.status === "asked")) {
+      inputs.push(require("../lib/root.cjs").installTools("data/hum-responses.jsonl"));
+    }
+  } catch {}
+  let have = null;
+  try { have = JSON.parse(fs.readFileSync(out, "utf8")); } catch {}
+  // A file whose reading failed is tried again (at most once an hour, by the marker below).
+  const stale = !have || have.date !== date || have.status !== "ok" || inputs.some((p) => mtime(p) > mtime(out));
+  if (stale && !(Date.now() - mtime(failed) < 3600_000)) {
+    const dayFile = path.join(TMP, `ds-day-${date}.for-records.json`);
+    try { fs.writeFileSync(dayFile, JSON.stringify(resolved)); } catch {}
+    const r = spawnSync(path.join(BIN, "meeting-record"), [date, "--tz", tz, "--day", dayFile],
+      { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 900_000 });
+    try { have = JSON.parse(fs.readFileSync(out, "utf8")); } catch { have = null; }
+    if (!have || have.date !== date || r.status !== 0) {
+      try { fs.writeFileSync(failed, new Date().toISOString() + "\n"); } catch {}
+      process.stderr.write(`[daily-summary-build] meeting-record ${date} did not finish (exit ${r.status}): `
+        + `${(r.stderr || r.error || "").toString().trim().slice(-300)}${have && have.date === date ? "; using what it wrote" : "; meetings are listed as scheduled"}\n`);
+    } else {
+      try { fs.rmSync(failed, { force: true }); } catch {}
+    }
+  }
+  if (have && have.date === date) {
+    resolved.meeting_records = { status: have.status || "ok", generated_at: have.generated_at, read_by: have.read_by || null,
+      records: have.records || [], skipped: have.skipped || [] };
+  } else {
+    resolved.meeting_records = { status: "failed", generated_at: null, read_by: null, records: [], skipped: [] };
+  }
+  if (process.env.JORI_MEETING_RECORD_ASK !== "0" && (resolved.meeting_records.records || []).some((x) => x.question)) {
+    // kernel-closure-ok: optional step, reached only when a record the tool itself wrote carries a question; a failed run is reported and skipped
+    const a = spawnSync(path.join(BIN, "meeting-record"), ["ask"], { encoding: "utf8", timeout: 180_000 });
+    if (a.status !== 0) process.stderr.write(`[daily-summary-build] meeting-record ask exit ${a.status}: ${(a.stderr || "").trim().slice(-200)}\n`);
+  }
+}
+
 // The day's decisions (an installation's own record of what the user decided
 // that day in some area it tracks): a list at the bottom of the report, never
 // stops. The hook lib/_ext/day-decisions.mjs exports attachDecisions({ date,
@@ -331,6 +388,9 @@ async function cmdPrep(date, resolvedOverride, confirmedPath, freshHarvest = fal
   // beats the time of the first visit row that names them, on the stop it falls in.
   // Re-applied on every prep: the resolved day on disk is the phone's reading only.
   applyCorrectionArrivals(resolved.stops, readCorrections(date), resolved.tz);
+  // The time of a calendar event the user gave in their own words (`day-correction add
+  // --event`) beats the calendar's, on every copy of that event the day carries.
+  applyCorrectionEventTimes(resolved, readCorrections(date));
   // Optional agent-vetted overrides: { "<stop_id>": "<confirmed venue>" } — chat
   // statements the agent confirmed. On a re-prep these settle the matching stops
   // before the JSON is re-emitted.
@@ -383,6 +443,7 @@ async function cmdPrep(date, resolvedOverride, confirmedPath, freshHarvest = fal
     resolved.tasks_completed = localizeTasksToStops(resolved.tasks_completed, resolved.stops, tz);
   }
   await attachCalls(date, resolved);
+  attachMeetingRecords(date, resolved, boundaryTzOf(resolved, tz));
   await attachDecisions(date, resolved);
   await attachHeldDigests(date, resolved);
   // A place-less event that missed every stop by minutes is the stop the person it
@@ -479,11 +540,18 @@ function cmdRender(date) {
   try { day = JSON.parse(fs.readFileSync(dayPath, "utf8")); }
   catch (e) { die(`render: bad day JSON at ${dayPath}: ${e.message}`); }
 
-  const photoHtmlById = {}, notShownById = {};
-  for (const s of day.stops || []) {
+  // A stop a meeting split into blocks (splitOnMeetings) shows each photo in the
+  // block its time falls in, so photos are embedded per block, and the manifest's
+  // per-stop flags below read all of a stop's blocks.
+  const photoHtmlById = {}, notShownById = {}, blockIdsOf = {};
+  const blocks = skeletonBlocks(day);
+  const shown = new Set(blocks.map(b => b._piece_of || b.id));
+  for (const b of blocks) (blockIdsOf[b._piece_of || b.id] = blockIdsOf[b._piece_of || b.id] || []).push(b.id);
+  for (const s of [...blocks, ...(day.stops || []).filter(x => !shown.has(x.id))]) {
     const p = renderStopPhotos(s);
     photoHtmlById[s.id] = p.html;
     notShownById[s.id] = p.notShown;
+    if (!blockIdsOf[s._piece_of || s.id]) blockIdsOf[s._piece_of || s.id] = [s.id];
   }
   const skeleton = buildSkeleton(day, photoHtmlById);
   fs.writeFileSync(path.join(TMP, `ds-skeleton-${date}.html`), skeleton);
@@ -495,8 +563,9 @@ function cmdRender(date) {
     try {
       const manifest = JSON.parse(fs.readFileSync(manPath, "utf8"));
       for (const m of manifest.stops) {
-        m.photos_rendered = !!(photoHtmlById[m.id] && photoHtmlById[m.id].trim());
-        m.photos_not_shown = notShownById[m.id] || [];
+        const ids = blockIdsOf[m.id] || [m.id];
+        m.photos_rendered = ids.some(id => !!(photoHtmlById[id] && photoHtmlById[id].trim()));
+        m.photos_not_shown = ids.flatMap(id => notShownById[id] || []);
       }
       fs.writeFileSync(manPath, JSON.stringify(manifest, null, 2));
     } catch (e) {
@@ -540,7 +609,9 @@ async function cmdPublish(date, prosePath, force = false) {
   // Two cheap checks catch it. Every prose key must name a stop that still
   // exists, and the settled JSON must not be NEWER than the prose — if it is,
   // the day was re-settled after the prose was written and the pairing is void.
-  const ids = new Set((day.stops || []).map(s => s.id));
+  // A stop a meeting split has a prose slot for each stay after the meeting (`<stop id>~N`),
+  // which exists in the email's blocks but not in the settled day's stops.
+  const ids = new Set([...(day.stops || []).map(s => s.id), ...skeletonBlocks(day).map(b => b.id)]);
   const orphans = Object.keys(prose.prose || {}).filter(k => !ids.has(k));
   const daySettledAt = fs.statSync(dayPath).mtimeMs;
   const proseWrittenAt = prosePath && fs.existsSync(prosePath) ? fs.statSync(prosePath).mtimeMs : Infinity;
@@ -565,10 +636,13 @@ async function cmdPublish(date, prosePath, force = false) {
   }
   const DISPLAY = new Set(["photo", "selfie", "live", "panorama", "burst", "video"]);
   for (const s of day.stops || []) {
-    s.photo_urls = (s.photos || [])
+    // photo_items carries each url's time, so the wiki page can put a photo in the
+    // block of a split stop that it was taken in (splitOnMeetings).
+    s.photo_items = (s.photos || [])
       .map(p => urlByUuid[p.uuid]).filter(r => r && DISPLAY.has(r.media_type))
       .sort((a, b) => (a.favorite ? 0 : 1) - (b.favorite ? 0 : 1) || String(a.taken_at).localeCompare(String(b.taken_at)))
-      .map(r => r.thumb_url);
+      .map(r => ({ url: r.thumb_url, taken_at: r.taken_at }));
+    s.photo_urls = s.photo_items.map(it => it.url);
   }
 
   const htmlPath = path.join(TMP, `daily-summary-${date}.html`);

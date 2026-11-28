@@ -16,6 +16,7 @@
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import { readStdinJson, emit, emitNull, stampRun, writeTopicState, localConfig } from "./_common.mjs";
+import { stockContext, stockLabel } from "../../../lib/stock-context.mjs";
 
 const require = createRequire(import.meta.url);
 const { brokerConfig, brokerFile } = require("../../../lib/broker-config.cjs");
@@ -90,12 +91,32 @@ if (!top || Math.abs(top.pct) < cfg.min_move_pct) {
 }
 
 const dir = top.pct >= 0 ? "up" : "down";
+
+// Never a bare ticker, and never a move with no why: look up the company's full
+// name and the day's news that mention it. Fail-open: an unreachable lookup
+// still emits, with the ticker and an explicit "no cause found" the composer
+// must say plainly (agent rule: stocks are named in full, with the why).
+let ctx = null;
+try { ctx = await stockContext(top.symbol, { now }); } catch {}
+const label = stockLabel(ctx) || top.symbol;
+
 stampRun("stocks", true);
 emit({
   topic: "stocks",
-  signal: `${top.symbol} ${dir} ${Math.abs(top.pct).toFixed(1)}% today`,
+  signal: `${label} ${dir} ${Math.abs(top.pct).toFixed(1)}% today`,
   urgency: Math.min(0.9, Math.abs(top.pct) / 10),
   freshness_min: 0,
   dedup_key: `stocks:${top.symbol}:${now.toISOString().slice(0, 10)}`,
-  supporting_data: { top, positions_count: list.length },
+  supporting_data: {
+    top,
+    positions_count: list.length,
+    company: ctx ? { ticker: ctx.ticker, name: ctx.name, exchange: ctx.exchange, industry: ctx.industry, sector: ctx.sector } : null,
+    // The day's stories that mention it, each with publisher and publish time
+    // (as_of = when they were fetched). Empty = say plainly that no cause was
+    // found; never guess one.
+    news: ctx?.news || [],
+    news_as_of: ctx?.as_of || null,
+    no_news_reason: ctx ? (ctx.no_news_reason || null) : "the news lookup did not run",
+    compose_rule: "Name the company in full with a one-phrase description of what it does on first mention (never the bare ticker), then one or two lines on why it moved from `news`, citing the publisher and its time; if `news` is empty, say plainly no cause could be found. Never guess a cause.",
+  },
 });

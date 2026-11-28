@@ -31,6 +31,12 @@ answer becomes part of the record and of the user's taste:
    (lane `event_followup`, id `evf-<ref>`, memory hook `event_followup:<ref>`)
    with two tappable answers and "Type something".
 
+The same tick then runs `bin/meeting-record tick` (the daily summary's meeting
+records): it files the user's replies to the records' own questions and sends at
+most one waiting question under the same rules (`JORI_MEETING_RECORD_ASK=0`
+skips it). An event this plugin already asked about is never asked about again
+there, and its answer is one of the record's signals.
+
 The chat agent files the reply (`agent/chat-agent/CLAUDE.md`, Hum Inbound
 Handling): `hum-answer` first, then `event-followup record <ref> --happened yes|no
 --text "<their words>"`, and asks one short follow-up for details when the user

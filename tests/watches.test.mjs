@@ -351,13 +351,52 @@ test("mailbox poll: the inbox alone by default, plus the labels an installation 
 
 test("mailbox poll: mail a filter labelled and kept out of the inbox still becomes an email.received event", () => {
   const queries = [];
-  const threads = [{ id: "t1", messageCount: 1, from: "Ticket Site <alerts@tickets.example>", subject: "Presale: a comedian in your city", date: "2026-11-20", labels: ["show-alerts"] }];
-  const deps = { watchConfig: { mailbox_labels: ["show-alerts"] }, gogJson: (args) => { queries.push(args[2]); return { threads }; } };
+  const messages = [{ id: "m1", threadId: "t1", from: "Ticket Site <alerts@tickets.example>", subject: "Presale: a comedian in your city", date: "2026-11-20 07:00", labels: ["show-alerts"] }];
+  const deps = { watchConfig: { mailbox_labels: ["show-alerts"] }, gogJson: (args) => { queries.push(args); return { messages }; } };
   const state = {};
   assert.deepEqual(W.emailEvents(state, Date.parse("2026-11-20T12:00:00Z"), deps), []); // cold start: watermark only
-  threads.push({ id: "t2", messageCount: 1, from: "Ticket Site <alerts@tickets.example>", subject: "On sale now", date: "2026-11-20", labels: ["show-alerts"] });
+  messages.unshift({ id: "m2", threadId: "t2", from: "Ticket Site <alerts@tickets.example>", subject: "On sale now", date: "2026-11-20 07:04", labels: ["show-alerts"] });
   const ev = W.emailEvents(state, Date.parse("2026-11-20T12:05:00Z"), deps);
-  assert.equal(queries[0], '{in:inbox label:"show-alerts"} newer_than:2d');
-  assert.deepEqual(ev.map((e) => [e.type, e.data.message_id]), [["email.received", "t2"]]);
+  assert.deepEqual(queries[0].slice(0, 4), ["gmail", "messages", "search", '{in:inbox label:"show-alerts"} newer_than:2d']);
+  assert.deepEqual(ev.map((e) => [e.type, e.data.message_id, e.data.thread_id]), [["email.received", "m2", "t2"]]);
   assert.deepEqual(ev[0].data.labels, ["show-alerts"]);
+});
+
+// Shaped like real `gog gmail messages search --json` output (2026-11-25): the
+// owner emailed a contractor first; the contractor's reply is message 2 of the
+// owner's thread. The old thread-level search reported that thread as
+// "from: the owner, subject: <the owner's subject>, labels: [SENT]".
+test("mailbox poll: a reply in a thread the owner started carries the replier's From and Subject; the owner's own messages are no candidates", () => {
+  const owner = "Owner Name <owner@example.com>";
+  const messages = [
+    { id: "a1", threadId: "a1", from: owner, subject: "Apartment combination at a condo", date: "2026-11-25 12:50", labels: ["SENT"] },
+  ];
+  const deps = { gogJson: () => ({ messages: [...messages], nextPageToken: "x" }) };
+  const state = {};
+  assert.deepEqual(W.emailEvents(state, Date.parse("2026-11-25T17:55:00Z"), deps), []); // armed
+  messages.unshift(
+    { id: "b2", threadId: "a1", from: "Pat Builder <pat@builder.example>", subject: "Re: Apartment combination at a condo", date: "2026-11-25 13:17", labels: ["Personal", "IMPORTANT", "CATEGORY_PERSONAL", "INBOX"] },
+    { id: "c3", threadId: "a1", from: owner, subject: "Re: Apartment combination at a condo", date: "2026-11-25 13:20", labels: ["SENT", "INBOX"] }, // owner cc'd himself
+  );
+  const ev = W.emailEvents(state, Date.parse("2026-11-25T18:20:00Z"), deps);
+  assert.deepEqual(ev.map((e) => e.subject_key), ["email:b2"]);
+  assert.equal(ev[0].type, "email.received");
+  assert.equal(ev[0].summary, "Email from Pat Builder <pat@builder.example>: Re: Apartment combination at a condo");
+  assert.deepEqual([ev[0].data.message_id, ev[0].data.thread_id, ev[0].data.from], ["b2", "a1", "Pat Builder <pat@builder.example>"]);
+  // The same messages on the next poll are not new again.
+  assert.deepEqual(W.emailEvents(state, Date.parse("2026-11-25T18:25:00Z"), deps), []);
+});
+
+test("mailbox poll: state from the old thread-keyed poll re-arms instead of replaying the inbox", () => {
+  const messages = [
+    { id: "m1", threadId: "t1", from: "A <a@x.example>", subject: "one", date: "2026-11-25 10:00", labels: ["INBOX"] },
+    { id: "m2", threadId: "t2", from: "B <b@x.example>", subject: "two", date: "2026-11-25 11:00", labels: ["INBOX"] },
+  ];
+  const deps = { gogJson: () => ({ messages }) };
+  const state = { email: { last_poll: "2026-11-25T17:00:00.000Z", seen: { "t1:1": "2026-11-25T15:00:00.000Z", "t2:3": "2026-11-25T16:00:00.000Z" } } };
+  assert.deepEqual(W.emailEvents(state, Date.parse("2026-11-25T17:05:00Z"), deps), []);
+  assert.equal(state.email.keys, "message");
+  assert.deepEqual(Object.keys(state.email.seen).sort(), ["m1", "m2"]);
+  messages.unshift({ id: "m3", threadId: "t1", from: "A <a@x.example>", subject: "Re: one", date: "2026-11-25 12:06", labels: ["INBOX"] });
+  assert.deepEqual(W.emailEvents(state, Date.parse("2026-11-25T17:10:00Z"), deps).map((e) => e.subject_key), ["email:m3"]);
 });

@@ -82,6 +82,22 @@
 // The calendar lane (agent/scripts/hum-harvesters/calendar.mjs) never counts
 // down to an unverified departure; it says to check the timetable instead.
 //
+// WHY AN INVITE CHECKS FOR THEIRS FIRST (2026-11-27). The user proposed a site
+// visit to a contractor by email; their coordinator answered that the time
+// worked and that she would send a calendar invite. Jori created its own event
+// and invited her and her colleague anyway, and her invite for the same hour
+// arrived two minutes later: two invitations for one meeting in three inboxes.
+// The user's rule: "if someone already sent me an invite ... there's no need
+// to send our own invite. we should just use theirs." So an invite (create
+// with --attendees, or update adding guests) first reads the slot, give or take
+// three hours, and refuses (exit 10) when an event organized by one of the
+// invitees, or by a colleague at their company's domain, is already there
+// (lib/their-invite.mjs). `--overlap-ok` does not pass it; only
+// `--their-invite-ok "<why this is a separate meeting>"` does. Refined the
+// same day: "if their invite comes first use theirs, but if they haven't sent
+// one by the time we're about to send ours - send ours instead." So the check
+// is at send time only; theirs arriving later changes nothing.
+//
 // WHAT THIS DOES NOT CLOSE. Bash is open to every agent, so a determined turn
 // can call `gog calendar` directly. Three further layers cover that: the MCP
 // write tools are removed from every agent's grant (agent/config/
@@ -102,6 +118,8 @@
 //   …and for any booking with a confirmation number (create or update):
 //     --booking-ref <confirmation number>   create refuses if an event already carries it; stamps it
 //     --booking-dup-ok "<why>"               only when one booking really needs two separate events
+//   …and, only when the invitees already sent an invite for this slot and this really is another meeting:
+//     --their-invite-ok "<why this is a separate meeting>"
 //   …and on update of an event the user made (see below):
 //     --from-confirmation <gmail messageId>   the booking's confirmation email licenses changing time/name/details
 //     --jori-event <job>                   this id came from <job>'s own earlier create
@@ -117,6 +135,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
+import { findTheirInvites, describeEvent } from "../lib/their-invite.mjs";
 
 const require = createRequire(import.meta.url);
 const { instance, localConfig, localDir } = require("../lib/instance.cjs");
@@ -230,11 +249,18 @@ const addAttendeeRaw = flag("--add-attendee") || "";
 const authorization = flag("--attendee-authorized") || "";
 const sendUpdates = flag("--send-updates");
 const dryRun = flag("--dry-run", false);
+// Leave a Zoom link as text only (no video-conference field). Rarely right; see
+// the Zoom section at the bottom of this file.
+const noZoomConference = flag("--no-zoom-conference", false);
 const overlapOk = flag("--overlap-ok") || "";
 const fromConfirmation = flag("--from-confirmation") || "";
 const joriEventClaim = flag("--jori-event") || "";
 const bookingRefRaw = flag("--booking-ref") || "";
 const bookingDupOk = flag("--booking-dup-ok") || "";
+const theirInviteOk = flag("--their-invite-ok") || "";
+// How far apart in time the other side's invite may sit and still be the same
+// meeting (they may have picked 10:30 for an 11:00 we proposed).
+const THEIR_INVITE_SLACK_MS = 3 * 3600e3;
 
 // A provider's confirmation number, as printed ("#40017733", "ABC-123").
 // lang-regex-ok: the shape of a machine identifier, never anything a person wrote.
@@ -343,6 +369,60 @@ if (attendees.length && authorization.trim().length < MIN_AUTHORIZATION_CHARS) {
     "",
     "See agent/CLAUDE.md § Calendar Invitations.",
   ], 4);
+}
+
+// ── Their invite is already here (create, or update that adds guests) ───────
+// See the their-invite note in the header. Runs after the attendee guard (only
+// an authorized invite gets this far) and before the overlap guard, so
+// `--overlap-ok` cannot wave it through and the refusal names the real fix.
+// Fails open on a read error, like the overlap guard: refusing every invite
+// because one read hiccuped would block the user's own ask (their rule: when
+// theirs is not there, send ours).
+if (attendees.length && (cmd === "create" || cmd === "update")) {
+  let from = peekFlag("--from");
+  let to = peekFlag("--to");
+  let invitees = attendees;
+  if (cmd === "update") {
+    const probe = spawnSync(GOG, ["calendar", "event", calendar, eventId, ...ACCOUNT_ARGS, "--no-input", "-j"], { encoding: "utf8" });
+    let ev = null;
+    if (probe.status === 0 && probe.stdout) { try { const j = JSON.parse(probe.stdout); ev = j.event || j; } catch {} }
+    if (ev) {
+      from = from || ev.start?.dateTime || ev.start?.date;
+      to = to || ev.end?.dateTime || ev.end?.date;
+      const already = new Set((ev.attendees || []).map((a) => String(a.email || "").toLowerCase()));
+      invitees = attendees.filter((a) => !already.has(a));
+    }
+  }
+  if (from && to && invitees.length) {
+    const pad = (t, d) => { const v = Date.parse(t); return Number.isFinite(v) ? new Date(v + d).toISOString() : t; };
+    const probe = spawnSync(GOG, [
+      "calendar", "events", calendar, ...ACCOUNT_ARGS, "--no-input", "-j",
+      "--from", pad(from, -THEIR_INVITE_SLACK_MS), "--to", pad(to, THEIR_INVITE_SLACK_MS),
+    ], { encoding: "utf8" });
+    let items = [];
+    if (probe.status === 0 && probe.stdout) { try { items = JSON.parse(probe.stdout).items || []; } catch { items = []; } }
+    const found = findTheirInvites(items, { invitees, from, to, owners: SELF, slackMs: THEIR_INVITE_SLACK_MS });
+    if (found.length && theirInviteOk.trim().length < MIN_OVERLAP_OK_CHARS) {
+      die([
+        `REFUSED: ${[...new Set(found.flatMap((f) => f.who))].join(", ")} already sent the user an invitation for this meeting:`,
+        "",
+        ...found.map((f) => `  · ${describeEvent(f.event)}`),
+        "",
+        "The user's rule (2026-11-27): when the other side already sent an invite,",
+        "do not send ours. Use theirs:",
+        "  · send nothing; their invitation is the meeting",
+        "  · if the time or place differs from what was agreed, tell the user instead",
+        "    of sending a competing invite",
+        "  · notes, links or a Zoom/Meet line for the user go in your reply to the user",
+        "    (their event's description is theirs to edit, not ours)",
+        "",
+        "Only if this genuinely is a different meeting with the same people, say why:",
+        '  --their-invite-ok "<why this is a separate meeting>"',
+        "",
+        "See agent/CLAUDE.md § Calendar Invitations.",
+      ], 10);
+    }
+  }
 }
 
 // ── The booking-reference guard (create only) ───────────────────────────────
@@ -693,6 +773,7 @@ try {
     jori_event_claim: joriEventClaim || null,
     booking_ref: bookingRef || null,
     booking_dup_override: bookingDupOk || null,
+    their_invite_override: theirInviteOk || null,
     // A departure: whether its time was verified and where it came from
     // (null = not a departure, or not known to be one).
     transit_verified: transitVerified,
@@ -704,5 +785,52 @@ try {
   if (attendees.length) process.exit(5);
 }
 
-const res = spawnSync(GOG, gogArgs, { stdio: "inherit" });
-process.exit(res.status ?? 1);
+// ── Zoom: set the event's video conference, not just a link ──────────────
+// The owner (2026-11-23): "when scheduling a zoom meeting using google calendar
+// … the video conferencing field should be set to zoom (automatically connects
+// my link)." A create/update whose location or description carries a Zoom join
+// link gets that link attached as the event's conferenceData ("Zoom Meeting",
+// the same as picking the Zoom add-on in Calendar), so Calendar shows a Join
+// button. gog cannot set it, so lib/calendar-zoom.mjs PATCHes it right after
+// gog's write. An event that already has a video conference is left alone.
+const zoomLink = (cmd === "create" || cmd === "update") && !dryRun && !noZoomConference
+  && process.env.JORI_CALENDAR_ZOOM !== "off"
+  ? (await import("../lib/calendar-zoom.mjs")).findZoomLink(peekFlag("--location"), peekFlag("--description"))
+  : null;
+
+if (!zoomLink) {
+  const res = spawnSync(GOG, gogArgs, { stdio: "inherit" });
+  process.exit(res.status ?? 1);
+}
+
+const zoom = await import("../lib/calendar-zoom.mjs");
+// Capture stdout to learn a new event's id, then pass it through unchanged.
+const res = spawnSync(GOG, gogArgs, { stdio: ["inherit", "pipe", "inherit"], encoding: "utf8" });
+if (res.stdout) process.stdout.write(res.stdout);
+if (res.status !== 0) process.exit(res.status ?? 1);
+let zoomEventId = eventId || zoom.parseCreatedId(res.stdout);
+if (!zoomEventId) {
+  // Text output we could not read: find the event we just wrote by its window and title.
+  const from = peekFlag("--from"), to = peekFlag("--to"), summary = peekFlag("--summary");
+  if (from && to) {
+    const probe = spawnSync(GOG, ["calendar", "events", calendar, `--from=${from}`, `--to=${to}`, ...ACCOUNT_ARGS, "--no-input", "-j"], { encoding: "utf8" });
+    try {
+      const items = JSON.parse(probe.stdout || "{}").events || JSON.parse(probe.stdout || "{}").items || [];
+      const hit = items.filter((e) => e && e.summary === summary).pop();
+      if (hit) zoomEventId = hit.id;
+    } catch { /* fall through */ }
+  }
+}
+const passcode = zoom.findPasscode(peekFlag("--description"));
+const z = zoomEventId
+  ? await zoom.attachZoom({ gog: GOG, account: ACCOUNT, calendar, eventId: zoomEventId, link: zoomLink, passcode })
+  : { ok: false, reason: "could not tell which event was written" };
+// The event itself was written; a failed attach is reported, never fatal.
+if (!z.ok) console.error(`jori-calendar: event saved, but Zoom was not set as its video conference (${z.reason}). The link is still in the event.`);
+else if (!z.skipped) console.error("jori-calendar: Zoom set as the event's video conference.");
+// Its own log, not calendar-writes.jsonl: the attendee audit matches rows there by
+// event id, and a row with no guest data must never look like a covering write.
+try {
+  fs.appendFileSync(path.join(path.dirname(LOG), "calendar-zoom.jsonl"), JSON.stringify({ ts: new Date().toISOString(), action: "zoom-conference", calendar, event_id: zoomEventId || null, ok: z.ok, skipped: Boolean(z.skipped), reason: z.reason || null }) + "\n");
+} catch { /* audit row is best-effort here: no guest is involved */ }
+process.exit(0);

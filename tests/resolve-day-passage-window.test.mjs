@@ -92,3 +92,76 @@ test("a verdict that judged most of the stop still flags it", () => {
   const [s] = classifyStops([stadiumStop()], ctx([machineRow(judged)]));
   assert.equal(s.user_non_stop, true);
 });
+
+// --- A place the user names for a window overrules the pipeline's own passage verdict ---
+// A short errand stop: the phone's visit row carries a machine `non-stop` verdict
+// (tag `[passage-auto`), then the user names the place for that window
+// (`location-confirm save-at`, no visit row patched). The named stop must stay a stop.
+const { addSavedAtStops } = rd._internal;
+const SHOP = LL(2400, 900);
+
+function errandStop() {
+  return { start_ts_ms: iso("2026-11-27T13:50:21Z"), end_ts_ms: iso("2026-11-27T13:59:50Z"), duration_minutes: 9,
+    centroid: { ...SHOP }, primary: { name: null, source: "unknown", confidence: 0 }, photos: [] };
+}
+function errandRow(notes, place_name = null) {
+  return { id: "row-1", arrived_at: "2026-11-27T13:50:17+00:00", departed_at: "2026-11-27T14:00:12+00:00",
+    latitude: SHOP.lat, longitude: SHOP.lon, place_name, place_type: "non-stop", notes };
+}
+const errandCtx = (userConfirmed) => ({ date: "2026-11-27", knownStopsEntries: [], userConfirmed });
+const ERRAND_MACHINE_NOTES = "[sweeper] departed_at synthesized | [passage-auto geometry] no rest over 0 min, covered 174 m";
+const ERRAND_DAY_FROM = Date.parse("2026-11-27T05:00:00Z"), ERRAND_DAY_TO = Date.parse("2026-11-28T05:00:00Z");
+const errandEntry = (over = {}) => ({ ask_id: "lc-at-20261128-133844", name: "Example Bakery",
+  centroid: { ...LL(2420, 930) }, source: "user_stated_at",
+  stop_window: { start: "2026-11-27T13:50:17+00:00", end: "2026-11-27T14:00:12+00:00" }, ...over });
+
+test("a stop only the pipeline's passage verdict called a non-stop is marked as such", () => {
+  const [s] = classifyStops([errandStop()], errandCtx([errandRow(ERRAND_MACHINE_NOTES)]));
+  assert.equal(s.user_non_stop, true);
+  assert.equal(s.non_stop_machine, true);
+});
+
+test("the user's own 'not a stop' answer is never marked machine, even beside a machine row", () => {
+  const [s] = classifyStops([errandStop()], errandCtx([
+    errandRow(ERRAND_MACHINE_NOTES),
+    { ...errandRow(null), id: "row-2", notes: "answered in chat" },
+  ]));
+  assert.equal(s.user_non_stop, true);
+  assert.equal(s.non_stop_machine, undefined);
+});
+
+test("a place the user names for the window clears the passage verdict and names the stop", () => {
+  const stops = classifyStops([errandStop()], errandCtx([errandRow(ERRAND_MACHINE_NOTES)]));
+  const added = addSavedAtStops(stops, [errandEntry()], ERRAND_DAY_FROM, ERRAND_DAY_TO);
+  assert.equal(added.length, 1);
+  assert.equal(added[0].same_visit, true);
+  assert.equal(added[0].passage_overruled, true);
+  assert.equal(stops.length, 1);
+  assert.equal(stops[0].place.name, "Example Bakery");
+  assert.equal(stops[0].place.source, "user_confirmed");
+  assert.equal(stops[0].user_non_stop, false, "the user said the stop happened");
+  assert.equal(stops[0].non_stop_machine, undefined);
+});
+
+test("the user's own 'not a stop' answer survives a later saved place for the same window", () => {
+  const stops = classifyStops([errandStop()], errandCtx([{ ...errandRow(null), notes: "answered in chat" }]));
+  const added = addSavedAtStops(stops, [errandEntry()], ERRAND_DAY_FROM, ERRAND_DAY_TO);
+  assert.equal(added[0].passage_overruled, undefined);
+  assert.equal(stops[0].user_non_stop, true);
+});
+
+test("a stop that was never a non-stop is untouched", () => {
+  const stops = classifyStops([errandStop()], errandCtx([]));
+  const added = addSavedAtStops(stops, [errandEntry()], ERRAND_DAY_FROM, ERRAND_DAY_TO);
+  assert.equal(added[0].passage_overruled, undefined);
+  assert.equal(stops[0].user_non_stop, false);
+  assert.equal(stops[0].place.name, "Example Bakery");
+});
+
+test("a stretch merged into a walk keeps its non-stop flag", () => {
+  const stops = classifyStops([errandStop()], errandCtx([errandRow(ERRAND_MACHINE_NOTES)]));
+  stops[0].merged_walk = { members: 2 };
+  const added = addSavedAtStops(stops, [errandEntry()], ERRAND_DAY_FROM, ERRAND_DAY_TO);
+  assert.equal(added[0].passage_overruled, undefined);
+  assert.equal(stops[0].user_non_stop, true);
+});

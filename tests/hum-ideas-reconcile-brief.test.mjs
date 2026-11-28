@@ -62,3 +62,23 @@ test("weekly brief: an answered ask is not 'being asked', and a row that is not 
   // Without the answers log the brief reads as before.
   assert.deepEqual(brief(ideas, NOW).asking_in_chat.map((i) => i.id), ["open", "done"]);
 });
+
+test("weekly brief: an idea the ranker retired is neither being asked nor waiting on an answer", () => {
+  const ideas = [
+    ask("open", { title: "Still waiting" }),
+    ask("answered-retired", { title: "Answered, then the situation ended" }),
+    ask("open-retired", { title: "Expired before it was asked" }),
+    idea({ id: "landed", status: "applied", applied_at: "2026-10-08T00:00:00Z", title: "Landed this week" }),
+  ];
+  const answers = answersById([
+    { ts: "2026-10-09T19:44:52Z", lane: "hum_improvement:answered-retired", disposition: "answered", reply_text: "Resume when we are back." },
+  ]);
+  const retired = new Set(["answered-retired", "open-retired", "landed"]);
+  const b = brief(ideas, NOW, 7, answers, retired);
+  assert.deepEqual(b.asking_in_chat.map((i) => i.id), ["open"]);
+  assert.deepEqual(b.answered_not_acted_on, []);
+  assert.deepEqual(b.landed.map((i) => i.id), ["landed"], "what landed is still reported");
+  assert.ok(!text(b).includes("not yet recorded on the idea"));
+  // Without a retired set the brief reads as before.
+  assert.deepEqual(brief(ideas, NOW, 7, answers).answered_not_acted_on.map((i) => i.id), ["answered-retired"]);
+});

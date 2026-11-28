@@ -343,9 +343,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     let gateReview = null;
     if (!request.params.arguments?.message_file) {
       try {
+        // A threaded reply: the gate must judge the answer against the message the
+        // user tapped Reply on, not against the newest question in the chat.
+        const parent = pendingEntry?.row ? await replyParent(pendingEntry.row) : null;
         const g = await gateOutbound({
           message, kind: "reply", channel: replyChannel, intent: "chat-reply",
           sender: null, reply_to_text: pendingEntry?.text || null,
+          replied_to: parent ? { role: parent.role, text: parent.content || "", at: parent.created_at || null } : null,
           conversation_id: pendingEntry?.conversation_id || null,
         });
         if (g.deliver && g.text) deliveredMessage = g.text;
@@ -664,14 +668,68 @@ function decisionReplyHint(parent) {
   return cardReplyHint(parent, REPLY_HINTS);
 }
 
+/**
+ * The message a threaded reply points at (`reply_to`), fetched once per inbound
+ * row and shared by everything that reads it: the agent's [Threaded reply] block,
+ * the answer router and the speak gate on the way out. Until 2026-11-27 only the
+ * agent saw it; the router and the gate read the reply against the conversation
+ * in time order and "corrected" a right answer into one about the newest
+ * question. Also carries, for a parent that is one of OUR replies, the user's
+ * message that reply answered (and what that one was threaded to), so "I wasn't
+ * replying to this" can be read against what they were actually replying to.
+ * Null when not threaded or unreadable.
+ */
+const replyParentCache = new Map();
+function replyParent(row) {
+  if (!row?.reply_to) return Promise.resolve(null);
+  const key = row.id || row.reply_to;
+  if (!replyParentCache.has(key)) {
+    if (replyParentCache.size > 200) replyParentCache.clear();
+    replyParentCache.set(key, fetchReplyParent(row.reply_to).catch((err) => {
+      console.error(`[phone-channel] Reply-parent fetch failed: ${err.message}`);
+      return null;
+    }));
+  }
+  return replyParentCache.get(key);
+}
+
+async function fetchReplyParent(parentId) {
+  const { data: parent } = await supabase
+    .from("jori_messages")
+    .select("id, role, content, created_at, metadata, channel, reply_to")
+    .eq("id", parentId)
+    .single();
+  if (!parent) return null;
+  if (parent.role !== "user") {
+    // Our reply rows carry no reply_to: the user message it answered is the newest
+    // user row in the same tab at or just before it (an ack row is replaced in
+    // place, so the reply's created_at is the ack's, a second after the message).
+    try {
+      const { data: prev } = await supabase
+        .from("jori_messages")
+        .select("id, content, created_at, reply_to")
+        .eq("role", "user")
+        .eq("channel", parent.channel || "chat")
+        .lte("created_at", parent.created_at)
+        .order("created_at", { ascending: false })
+        .limit(1);
+      const answered = prev?.[0];
+      if (answered && Date.parse(parent.created_at) - Date.parse(answered.created_at) < 5 * 60e3) {
+        parent.answered = { content: answered.content, created_at: answered.created_at };
+        if (answered.reply_to) {
+          const { data: gp } = await supabase.from("jori_messages").select("role, content").eq("id", answered.reply_to).single();
+          if (gp) parent.answered.replied_to = gp;
+        }
+      }
+    } catch { /* the parent alone is still the anchor */ }
+  }
+  return parent;
+}
+
 async function buildReplyBlock(row, tz) {
   if (!row?.reply_to) return "";
   try {
-    const { data: parent } = await supabase
-      .from("jori_messages")
-      .select("role, content, created_at, metadata")
-      .eq("id", row.reply_to)
-      .single();
+    const parent = await replyParent(row);
     if (!parent) return "";
     const decisionHint = decisionReplyHint(parent);
 
@@ -697,7 +755,11 @@ async function buildReplyBlock(row, tz) {
       ? "their own earlier message"
       : "an earlier message of yours";
 
-    return `[Threaded reply] ${OWNER_LABEL} replied directly to ${whose}${when ? ` from ${when}` : ""}, not to the newest message in the conversation above:\n"""\n${body}\n"""\nRead their message below as an answer to THAT, and answer in that context.\n\n${decisionHint}`;
+    const clip = (t, n = 400) => { const x = String(t || ""); return x.length > n ? x.slice(0, n) + "…" : x; };
+    const chain = parent.answered
+      ? `That message of yours was your answer to their message "${clip(parent.answered.content)}"${parent.answered.replied_to ? `, which itself was a threaded reply to ${parent.answered.replied_to.role === "user" ? "their own" : "your"} message "${clip(parent.answered.replied_to.content)}"` : ""}.\n`
+      : "";
+    return `[Threaded reply] ${OWNER_LABEL} replied directly to ${whose}${when ? ` from ${when}` : ""}, not to the newest message in the conversation above:\n"""\n${body}\n"""\n${chain}Read their message below as an answer to THAT, and answer in that context. Never re-read it against a newer question, a pending question or the conversation's order.\n\n${decisionHint}`;
   } catch (err) {
     console.error(`[phone-channel] Reply-parent fetch failed: ${err.message}`);
     return "";
@@ -800,7 +862,9 @@ async function routeOpenAnswer(row, text) {
     q = row.conversation_id ? q.eq("conversation_id", row.conversation_id) : q.eq("channel", row.channel || "chat");
     const { data } = await q;
     const history = historyFrom((data || []).reverse(), { ceo: OWNER_LABEL, excludeId: row.id });
-    const outcome = await routeAnswer({ messageId: row.id, text, conversationId: row.conversation_id || null, history });
+    const parent = await replyParent(row);
+    const outcome = await routeAnswer({ messageId: row.id, text, conversationId: row.conversation_id || null, history,
+      replyTo: row.reply_to || null, repliedToText: parent?.content || null });
     if (!["none", "no_open_questions", "skipped"].includes(outcome.status)) log(`answer-router: ${outcome.status} ${JSON.stringify(outcome.filed || outcome.failed || outcome.attempts || "")}`.slice(0, 300));
     return outcome;
   } catch (err) {
@@ -842,7 +906,7 @@ async function handleIncomingMessage(row) {
   if (pendingMessages.has(msgId)) return; // already processing
   // Anything new the user sends goes after a share still being collected.
   if (!row.shareBundleIds) shareBundler.flush();
-  pendingMessages.set(msgId, { text, t0_created: createdAt, channel: row.channel || "chat", conversation_id: row.conversation_id || null });
+  pendingMessages.set(msgId, { text, t0_created: createdAt, channel: row.channel || "chat", conversation_id: row.conversation_id || null, row });
   ensureStreamPoll();
   stampPickedUp(row);
 

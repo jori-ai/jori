@@ -302,7 +302,12 @@ async function main() {
   // purpose of the drive" is answered (the user's calendar, what the user said in chat). The
   // calendar check above has already run. Set membership over a token we wrote.
   const turnaround = isTurnaround(visit.notes);
-  let l1 = classifyWindow({ points, start, end });
+  // `center`: where the phone's own visit detector put the stay. A fix of the
+  // window's own at that spot makes the fixes at its edges the leg in and out,
+  // not movement inside it (lib/stop-passage.mjs EDGE_FIX_S, 2026-11-27).
+  const center = Number.isFinite(Number(visit.latitude)) && Number.isFinite(Number(visit.longitude))
+    && visit.segment_type === "visit" ? { lat: Number(visit.latitude), lon: Number(visit.longitude) } : null;
+  let l1 = classifyWindow({ points, start, end, center });
   if (turnaround) l1 = asTurnaround(l1);
 
   // The routine walk from home: a stop on it is part of the walk. Not for a row

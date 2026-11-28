@@ -158,6 +158,45 @@ test("a signature dispatched inside the dedup window is suppressed, and re-escal
   assert.equal(outside.escalate.length, 1, "a condition still firing a day later deserves another look");
 });
 
+// Guards the second Opus escalation of one alert row: the nightly pass did not
+// run (host down over its slot), so the cursor stayed behind the row, and once
+// the 24 h marker lapsed the unchanged row passed every check and was
+// dispatched again with no new information.
+test("the row a marker was written for is never re-escalated, however old the marker; a newer row still is", () => {
+  const sig = (r) => signature(r.content);
+  const old = MAXAUTH("2026-07-23T03:00:00Z");
+  const dispatched = { [sig(old)]: "2026-07-23T04:00:00Z" };
+  const later = Date.parse("2026-07-24T05:00:00Z"); // 25 h after the marker
+
+  const same = selectCriticalEscalations({ rows: [old], cursor: "2026-07-22T00:00:00Z", clusters: [], dispatched, now: later });
+  assert.equal(same.escalate.length, 0, "created before the marker: it is the escalated row");
+  assert.equal(same.suppressed.already_dispatched, 1);
+
+  const atMarker = selectCriticalEscalations({
+    rows: [MAXAUTH("2026-07-23T04:00:00Z")], cursor: "2026-07-22T00:00:00Z", clusters: [], dispatched, now: later,
+  });
+  assert.equal(atMarker.escalate.length, 0, "created at the marker instant counts as the same row");
+
+  const recurrence = selectCriticalEscalations({
+    rows: [old, MAXAUTH("2026-07-23T20:00:00Z")], cursor: "2026-07-22T00:00:00Z", clusters: [], dispatched, now: later,
+  });
+  assert.equal(recurrence.escalate.length, 1, "a firing after the marker is a real recurrence once the window lapsed");
+  assert.equal(recurrence.escalate[0].created_at, "2026-07-23T20:00:00Z");
+});
+
+test("an unparseable marker or row time falls back to the window rule and never throws", () => {
+  const row = MAXAUTH("2026-07-24T12:00:00Z");
+  const badMarker = { [signature(row.content)]: "not-a-date" };
+  const r1 = selectCriticalEscalations({ rows: [row], cursor: "2026-07-24T00:00:00Z", clusters: [], dispatched: badMarker, now: Date.parse("2026-07-24T13:00:00Z") });
+  assert.equal(r1.escalate.length, 1, "a garbled marker does not hide a critical alert");
+  const badRow = { ...row, created_at: "garbled" };
+  const r2 = selectCriticalEscalations({
+    rows: [badRow], cursor: null, clusters: [], dispatched: { [signature(row.content)]: "2026-07-24T06:00:00Z" },
+    now: Date.parse("2026-07-24T12:00:00Z"),
+  });
+  assert.equal(r2.suppressed.already_dispatched, 1, "inside the window it is still suppressed");
+});
+
 test("user rows in the system channel are never escalated", () => {
   const { escalate } = selectCriticalEscalations({
     rows: [{ role: "user", created_at: "2026-07-24T09:00:00Z", content: "🔴 review these please" }],

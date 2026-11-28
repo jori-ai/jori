@@ -97,7 +97,16 @@ async function check() {
     }
     return out({ adopted: true, ref: refOf(key), title: ev.title, reading: r });
   }
-  const toAsk = judged.filter((j) => j.r.ask).sort((a, b) => Date.parse(b.ev.end) - Date.parse(a.ev.end));
+  // An event the daily summary's meeting records (bin/meeting-record) already asked about is not asked again.
+  let mrAsked = [];
+  try {
+    const fs = await import("node:fs");
+    const st = JSON.parse(fs.readFileSync(process.env.MEETING_RECORD_STATE || path.join(ROOT, "data", "meeting-records", "state.json"), "utf8"));
+    mrAsked = Object.values(st.questions || {}).filter((q) => q && ["asked", "filed", "answered_elsewhere"].includes(q.status));
+  } catch {}
+  const mrHas = (ev) => mrAsked.some((q) => String(q.summary).trim().toLowerCase() === String(ev.title).trim().toLowerCase()
+    && Math.abs(Date.parse(q.start) - Date.parse(ev.start)) < 3 * 3600e3);
+  const toAsk = judged.filter((j) => j.r.ask && !mrHas(j.ev)).sort((a, b) => Date.parse(b.ev.end) - Date.parse(a.ev.end));
   if (!toAsk.length) { if (!dry) writeState(state); return out({ asked: false, why: "nothing worth a follow-up", judged: judged.length }); }
 
   const pace = force ? { ok: true } : paced(state, cfg, now);
@@ -187,4 +196,14 @@ if (!COMMANDS[cmd]) {
   process.exit(cmd ? 2 : 0);
 }
 const code = await COMMANDS[cmd]();
+// The day's meeting records (bin/meeting-record) ask on this tick too: it files the user's
+// replies to their questions, then sends at most one waiting question, paced like this
+// plugin (quiet hours, a daily cap, never over another waiting question). Same launchd
+// session, so the outbound check's model step can run. JORI_MEETING_RECORD_ASK=0 skips it.
+if (cmd === "check" && !has("dry-run") && !flag("adopt") && process.env.JORI_MEETING_RECORD_ASK !== "0") {
+  const { spawnSync } = await import("node:child_process");
+  const t = spawnSync(process.execPath, [path.join(ROOT, "bin", "meeting-record"), "tick"], { encoding: "utf8", timeout: 600000 });
+  if (t.stdout) process.stdout.write(t.stdout);
+  if (t.status !== 0 && t.stderr) process.stderr.write(t.stderr.slice(-400));
+}
 process.exit(typeof code === "number" ? code : 0);

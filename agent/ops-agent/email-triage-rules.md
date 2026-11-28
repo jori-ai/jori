@@ -168,6 +168,11 @@ Assign one label from the instance's label set (listed in the local additions un
 - **P2 (today):** Requires the user's reply within 24h
 - **P3 (FYI):** Newsletters, receipts, automated notifications — label and mark read
 
+**Two content P1s that need more than the one email (2026-11-23, from the strict-triage shadow week, where the live agent caught both and the one-shot did not):**
+
+- **Repeated account-security alerts.** Several sign-in, new-device, verification or password-reset alerts for one account within about an hour, that no sign-in the user or Jori itself started explains, can be someone trying to get in: P1, star, unread, and a ping asking whether it was them. A single alert keeps its usual priority, and so does a burst that Jori's own sign-in attempts at that site explain (Jori's sign-in log, `bin/login-log`; the strict one-shot reads it with `own_signins`, and the sender's recent mail with `sender_recent`).
+- **An email that contradicts the calendar.** When an email about a meeting or booking already on the user's calendar gives a different date, time, place or joining link than that event, and it is not the organizer's own change (which updates the event, § Bookings and Appointments), the user has to know which one to trust: P1, star, unread, and a ping naming both versions. Leave the event as it is.
+
 **Before settling on a priority, run Step 4a** — a reply to something the user sent is P1 no matter what the rules above or any fast-path below would have said.
 
 ### Step 4a: A reply to an email the user sent is ALWAYS P1 (added 2026-08-17)
@@ -342,6 +347,8 @@ This applies regardless of content — test results, appointment reminders, doct
 The **senders** are on the P1 sender list (Step 0e) — `mychart`, `@epic.com` — so they arrive already carrying `p1`; add any new portal domain with `p1-sender add`. The **subject** signals ("MyChart", "test results", "your doctor", "message from your care team") stay a content rule in `local-triage-rules.json` (`medical-subject`), because they catch a provider whose domain nobody has listed yet.
 
 ### Calendar event creation and updates — run through `calendar-scheduling`
+
+**Their invite first wins (the user's rule, 2026-11-27).** Before sending an invitation, `jori-calendar` checks whether the people you would invite already sent the user one for that meeting and refuses (exit 10) if so: use theirs and send nothing. If theirs is not there yet, send ours; an invite of theirs arriving after ours changes nothing. Never delete or edit their event.
 
 **Any time this agent creates or updates a calendar event** — from a meeting invite in triage, a reschedule, a ticket confirmation, a cancellation (below), or any webhook-dispatched task that touches the calendar — **invoke the `calendar-scheduling` skill first**, then write via `~/Dev/jori/bin/jori-calendar create|update`. That wrapper is the **only sanctioned write path** (`agent/CLAUDE.md` § Calendar Invitations): it refuses any attendee other than the user unless you pass `--attendee-authorized "<what the user actually said>"`, and it sets `--send-updates` correctly on its own. **Do not call the raw calendar CLI's create/update directly, and do not reach for the MCP `gcal_create_event`/`gcal_update_event` tools** — those are no longer granted to any agent (`allowedTools` in `agents.json` lists only the read half), and a pre-commit lint fails new code that routes around the wrapper. Reads — `gog calendar list|show`, the MCP list/get/search tools — are unrestricted. The skill encodes: busy/free transparency rules, shared-event conflict rules, the household's own event conventions, weekday-only outside-party coordination, routine-maintenance bounds, per-visit sizing, pacing / don't-pack rule, events-vs-tasks heuristic, home-timezone discipline, color conventions, reminder defaults (`useDefault:true`), and `--send-updates all` when attendees are present. Scheduling without it reliably produces conflicts that the user has to fix manually.
 
