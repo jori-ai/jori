@@ -329,6 +329,7 @@ function attachMeetingRecords(date, resolved, tz) {
     resolved.meeting_records = { status: "failed", generated_at: null, read_by: null, records: [], skipped: [] };
   }
   if (process.env.JORI_MEETING_RECORD_ASK !== "0" && (resolved.meeting_records.records || []).some((x) => x.question)) {
+    // kernel-closure-ok: optional step, reached only when a record the tool itself wrote carries a question; a failed run is reported and skipped
     const a = spawnSync(path.join(BIN, "meeting-record"), ["ask"], { encoding: "utf8", timeout: 180_000 });
     if (a.status !== 0) process.stderr.write(`[daily-summary-build] meeting-record ask exit ${a.status}: ${(a.stderr || "").trim().slice(-200)}\n`);
   }
@@ -608,7 +609,9 @@ async function cmdPublish(date, prosePath, force = false) {
   // Two cheap checks catch it. Every prose key must name a stop that still
   // exists, and the settled JSON must not be NEWER than the prose — if it is,
   // the day was re-settled after the prose was written and the pairing is void.
-  const ids = new Set((day.stops || []).map(s => s.id));
+  // A stop a meeting split has a prose slot for each stay after the meeting (`<stop id>~N`),
+  // which exists in the email's blocks but not in the settled day's stops.
+  const ids = new Set([...(day.stops || []).map(s => s.id), ...skeletonBlocks(day).map(b => b.id)]);
   const orphans = Object.keys(prose.prose || {}).filter(k => !ids.has(k));
   const daySettledAt = fs.statSync(dayPath).mtimeMs;
   const proseWrittenAt = prosePath && fs.existsSync(prosePath) ? fs.statSync(prosePath).mtimeMs : Infinity;

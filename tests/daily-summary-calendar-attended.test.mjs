@@ -303,3 +303,43 @@ test("an in-person record with no start, at a place the stop is not, is listed a
   process.env.JORI_RECORD_PLAN_CLOCK_PLACE = "0";
   try { assert.equal(attendedEvents(d).byStop["s-1"].length, 1); } finally { delete process.env.JORI_RECORD_PLAN_CLOCK_PLACE; }
 });
+
+// 2026-11-28: the stay after a meeting has a prose slot of its own. A stop a meeting
+// split into blocks (Home, Meeting, Home) kept its prose on the first block only, so the
+// stay after the meeting printed as a bare header (the reviewer read it as the same stay
+// twice) and what happened after the meeting had no block to be written under.
+const { continuationBlocks } = render._internal;
+const PLANNING = ev("Planning call", "10:00", "11:00");
+const VENDOR = ev("Vendor visit", "14:00", "15:00");
+const contDay = (busy) => ({ date: "2026-11-25", tz: TZ, tzs: [TZ], travel_legs: [], unmatched_calendar_events: [],
+  stops: [stop("s-1", "07:45", "19:01", "Home", { address: "12 Palm Way, Springfield" })], calendar_busy: busy });
+
+test("the stay after a meeting is a continuation block with its own id; the first block keeps the stop's id", () => {
+  const d = contDay([PLANNING]);
+  assert.deepEqual(continuationBlocks(d).map(b => [b.id, b._piece_of, b.start, b.end]), [["s-1~2", "s-1", "11:00", "19:01"]]);
+  assert.equal(render.skeletonBlocks(d)[0].id, "s-1");
+  assert.deepEqual(continuationBlocks(contDay([PLANNING, VENDOR])).map(b => [b.id, b.start]), [["s-1~2", "11:00"], ["s-1~4", "15:00"]]);
+  assert.deepEqual(continuationBlocks(contDay([])), [], "a stop no meeting splits has none");
+});
+
+test("the manifest lists each continuation as a prose slot with the window it covers", () => {
+  const m = render.buildManifest(contDay([PLANNING]), {});
+  assert.deepEqual(m.prose_slots, ["s-1", "s-1~2"]);
+  assert.deepEqual(m.prose_blocks, [{ id: "s-1~2", continues: "s-1", start: "11:00", end: "19:01" }]);
+  assert.deepEqual(render.buildManifest(contDay([]), {}).prose_blocks, []);
+});
+
+test("the email and the wiki page print a continuation's prose under its own header, and no aside slot for it", () => {
+  const d = contDay([PLANNING]);
+  const skeleton = render.buildSkeleton(d, {});
+  assert.ok(skeleton.includes("{{PROSE:s-1}}") && skeleton.includes("{{PROSE:s-1~2}}"), skeleton);
+  assert.ok(skeleton.includes("{{ASIDE:s-1}}") && !skeleton.includes("{{ASIDE:s-1~2}}"), "only the stop's own block has an aside");
+  const prose = { prose: { "s-1": "MORNING", "s-1~2": "AFTERNOON" } };
+  for (const out of [render.assemble(skeleton, prose), render.buildMarkdown(d, prose)]) {
+    const at = (m) => out.indexOf(m);
+    assert.ok(at("MORNING") > 0 && at("MORNING") < at("Planning call") && at("Planning call") < at("AFTERNOON"), out);
+  }
+  // a continuation with no prose is an empty paragraph, as the first block is; a meeting block never takes prose
+  assert.ok(!render.assemble(skeleton, { prose: { "s-1": "MORNING" } }).includes("{{PROSE"));
+  assert.ok(!render.assemble(skeleton, { prose: { "s-1~1": "NOT PRINTED" } }).includes("NOT PRINTED"));
+});
