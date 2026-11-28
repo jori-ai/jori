@@ -247,3 +247,89 @@ const { homeLoopConfig } = createRequire(import.meta.url)("../lib/day-excursions
     assert.equal(homeLoopVerdict({ ...W, fixes: driven, visits: VISITS, now: Date.parse(z("23:30:00")) }), null);
   });
 }
+
+// ---------------------------------------------------------------------------
+// A short stop must not be withdrawn on the strength of the leg in or out of it.
+// 2026-11-27, a short errand: the phone's visit row said stationary 9.6 min, one fix
+// sat at the shop, and the first driving fix OF THE DRIVE AWAY landed on the row's
+// closing second 170 m on. Counted inside the window it read "covered 170 m, 100%
+// moving" and the stop was withdrawn as a passage. Synthetic geometry again.
+// ---------------------------------------------------------------------------
+{
+  const WIN = { start: "2026-10-06T09:00:00Z", end: "2026-10-06T09:09:30Z" };
+  const CENTER = fakeAt(3, 2); // where the visit detector put the stay
+  const SHOP_RUN = [
+    fix("08:59:46", ...fakePt(-290, 0), 2, "driving"),   // the way in (as far back as the real trace: the silences stay under 5 min)
+    fix("09:04:40", ...fakePt(0, 0), 23, "unknown"),     // the window's own fix, at the shop
+    fix("09:09:30", ...fakePt(170, 0), 5, "driving"),    // the way out, on the closing second
+  ];
+
+  test("short stop: without the visit's centre the geometry reads it as before (nothing else changes)", () => {
+    const r = classifyWindow({ points: pointsFrom({ fixes: SHOP_RUN }), ...WIN });
+    assert.equal(r.verdict, "passage", "the old shape, kept for callers that have no centre");
+    assert.equal(r.features.dwell_at_row, false);
+    assert.equal(r.features.edge_fixes_set_aside, 0);
+  });
+
+  test("short stop: a fix of its own at the visit's spot makes the fix on the way out the leg, not the window", () => {
+    const r = classifyWindow({ points: pointsFrom({ fixes: SHOP_RUN }), ...WIN, center: CENTER });
+    assert.equal(r.verdict, "inconclusive", r.reason);
+    assert.equal(r.features.dwell_at_row, true);
+    assert.equal(r.features.edge_fixes_set_aside, 1);
+    assert.equal(r.features.points_in_window, 1);
+    assert.equal(r.features.spread_m, 0, "the drive away is not ground covered inside the stop");
+    assert.equal(r.features.moving_share, null);
+  });
+
+  test("a drive is still a passage: its inside fix is a driving one, so there is no dwell", () => {
+    const drive = [
+      fix("08:59:50", ...fakePt(-400, 0), 5, "driving"),
+      fix("09:04:40", ...fakePt(0, 0), 8, "driving"),
+      fix("09:09:30", ...fakePt(400, 0), 5, "driving"),
+    ];
+    const r = classifyWindow({ points: pointsFrom({ fixes: drive }), ...WIN, center: CENTER });
+    assert.equal(r.features.dwell_at_row, false);
+    assert.equal(r.verdict, "passage", r.reason);
+  });
+
+  test("a walk past the spot is still a passage: a walking fix there is the walk itself", () => {
+    const walk = [
+      fix("09:00:10", ...fakePt(-250, 0), 10, "walking"),
+      fix("09:04:40", ...fakePt(0, 0), 10, "walking"),
+      fix("09:08:30", ...fakePt(250, 0), 10, "walking"),
+    ];
+    const r = classifyWindow({ points: pointsFrom({ fixes: walk }), ...WIN, center: CENTER });
+    assert.equal(r.features.dwell_at_row, false);
+    assert.equal(r.verdict, "passage", r.reason);
+  });
+
+  test("a walk in does not turn a dwell into a passage (2026-11-13 restaurant, confirmed by the user)", () => {
+    const shop = [
+      fix("09:00:00", ...fakePt(-420, 0), 15, "walking"),
+      fix("09:02:20", ...fakePt(-90, 30), 16, "walking"),  // on the way in, 90 m off: a moving fix inside the window
+      fix("09:05:55", ...fakePt(20, 10), 32, "unknown"),   // at the shop
+      fix("09:09:30", ...fakePt(170, 80), 22, "walking"),  // leaving, on the closing second
+    ];
+    const old = classifyWindow({ points: pointsFrom({ fixes: shop }), ...WIN });
+    assert.equal(old.verdict, "passage", "geometry alone reads 100% of the tags moving");
+    const r = classifyWindow({ points: pointsFrom({ fixes: shop }), ...WIN, center: CENTER });
+    assert.equal(r.verdict, "inconclusive", r.reason);
+    assert.match(r.reason, /visit detector/);
+  });
+
+  test("a rest the geometry observes is still a rest, centre or not", () => {
+    const sit = [fix("09:00:30", ...fakePt(0, 0), 8, "stationary"), fix("09:04:30", ...fakePt(2, 1), 8, "stationary"),
+      fix("09:08:30", ...fakePt(1, 0), 8, "stationary"), fix("09:12:00", ...fakePt(300, 0), 10, "walking")];
+    const r = classifyWindow({ points: pointsFrom({ fixes: sit }), ...WIN, center: CENTER });
+    assert.equal(r.verdict, "rest");
+  });
+
+  test("Jev is told about the dwell only when there is one", () => {
+    const withDwell = classifyWindow({ points: pointsFrom({ fixes: SHOP_RUN }), ...WIN, center: CENTER }).features;
+    const without = classifyWindow({ points: pointsFrom({ fixes: SHOP_RUN }), ...WIN }).features;
+    const a = buildState({ ...WIN, features: withDwell });
+    const b = buildState({ ...WIN, features: without });
+    assert.match(a.movement.phones_own_visit_detector, /recorded a stay here/);
+    assert.equal(b.movement.phones_own_visit_detector, undefined);
+  });
+}
